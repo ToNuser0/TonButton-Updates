@@ -1,4 +1,4 @@
-# TonButton_Autoclick (ToNのタン自動押下マクロ)
+# TonButton_Autoclick (ToNのボタン自動押下マクロ)
 
 このソフトウェアはVRChatのログ監視とOSCを用いた、ToNのボタン自動押下マクロです。
 自動アップデート機構を搭載しており、常に最新の状態でご利用いただけます。
