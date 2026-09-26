@@ -1,0 +1,720 @@
+import datetime
+import glob
+import os
+import sys
+import threading
+import time
+import ctypes
+from ctypes import wintypes
+import socket
+import struct
+import json
+import urllib.request
+import subprocess
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import pydirectinput
+
+# pydirectinputの内部遅延を無効化し最高精度にする
+pydirectinput.PAUSE = 0
+
+# 外観設定
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# ==========================================
+# 🔧 【開発者設定】自動アップデート用の設定
+# ==========================================
+CURRENT_VERSION = "1.0.0"  # 現在のバージョン
+UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
+# ==========================================
+
+def resource_path(relative_path):
+    try: base_path = sys._MEIPASS
+    except Exception: base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def create_icon_if_needed():
+    if getattr(sys, 'frozen', False): return
+    icon_path = "icon.ico"
+    if not os.path.exists(icon_path):
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new('RGB', (256, 256), color='black')
+            draw = ImageDraw.Draw(img)
+            try: font = ImageFont.truetype("arialbd.ttf", 64)
+            except Exception: font = ImageFont.load_default()
+            text = "BEGIN"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((256-w)/2, (256-h)/2 - bbox[1]/2), text, fill="red", font=font)
+            img.save(icon_path, format="ICO", sizes=[(256, 256)])
+        except Exception: pass
+
+create_icon_if_needed()
+
+# --- MP3再生 (WinMM使用・非同期・超軽量) ---
+def play_alert_sound(file_path):
+    if not os.path.exists(file_path) or not file_path: return
+    try:
+        ctypes.windll.winmm.mciSendStringW('stop alert_sound', None, 0, None)
+        ctypes.windll.winmm.mciSendStringW('close alert_sound', None, 0, None)
+        cmd_open = f'open "{file_path}" alias alert_sound'
+        ctypes.windll.winmm.mciSendStringW(cmd_open, None, 0, None)
+        ctypes.windll.winmm.mciSendStringW('play alert_sound', None, 0, None)
+    except Exception: pass
+
+# --- OSCパケット解析 ---
+def parse_osc_float(data, target_addr):
+    try:
+        null_idx = data.find(b'\x00')
+        if null_idx == -1: return None
+        addr = data[:null_idx].decode('utf-8', 'ignore')
+        if addr != target_addr: return None
+        
+        align_addr = (null_idx + 4) & ~3
+        null_idx_type = data.find(b'\x00', align_addr)
+        if null_idx_type == -1: return None
+        type_tags = data[align_addr:null_idx_type].decode('utf-8', 'ignore')
+        if type_tags != ",f": return None
+        
+        align_type = (null_idx_type + 4) & ~3
+        if len(data) >= align_type + 4:
+            return struct.unpack(">f", data[align_type:align_type+4])[0]
+    except Exception: pass
+    return None
+
+
+class VRCMacroApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"TonButton_Autoclick.exe (v{CURRENT_VERSION})")
+        self.geometry("740x800")
+        self.minsize(400, 300)
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        
+        icon_path = resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            try: self.iconbitmap(icon_path)
+            except Exception: pass
+        
+        self.is_running = False
+        self.stop_event = threading.Event()
+        self.action_lock = threading.Lock() 
+        self.is_standby = False
+        self.last_valid_time = time.time()
+        
+        self.current_velocity = 0.0
+        self.max_velocity_during_test = 0.0
+        self.is_testing_speed = False
+        
+        self.TARGET_KEYWORD = "Round was valid."
+        self.RECOVERY_KEYWORD = "Verified"
+        self.FALSE_POSITIVE_1 = "checking for Verified account"
+        self.FALSE_POSITIVE_2 = "Verified Round End"
+        
+        self._build_ui()
+        self._auto_detect_log()
+        self._load_config()
+
+        # 【お掃除機能】起動時に古いEXEを安全に削除
+        self._cleanup_old_versions()
+
+        self.integrated_monitor_thread = threading.Thread(target=self._integrated_monitor_worker, daemon=True)
+        self.integrated_monitor_thread.start()
+        
+        self.osc_thread = threading.Thread(target=self._osc_worker, daemon=True)
+        self.osc_thread.start()
+        
+        self.global_watcher_thread = threading.Thread(target=self._global_watcher_worker, daemon=True)
+        self.global_watcher_thread.start()
+
+        self._check_for_updates()
+
+    # ==========================================
+    # 🚀 OTAアップデート & お掃除処理
+    # ==========================================
+    def _cleanup_old_versions(self):
+        """古いバージョンがロック解除されるまでリトライして確実に消す"""
+        if not getattr(sys, 'frozen', False): return
+        def cleanup():
+            current_exe = os.path.abspath(sys.executable)
+            exe_dir = os.path.dirname(current_exe)
+            
+            for _ in range(5):
+                time.sleep(2.0)
+                all_cleaned = True
+                for file in glob.glob(os.path.join(exe_dir, "TonButton_Autoclick*.exe")):
+                    if os.path.abspath(file) != current_exe:
+                        try:
+                            os.remove(file)
+                            self.log(f"【クリーンアップ】旧バージョンを削除しました: {os.path.basename(file)}")
+                        except Exception:
+                            all_cleaned = False
+                if all_cleaned:
+                    break
+                    
+        threading.Thread(target=cleanup, daemon=True).start()
+
+    def _check_for_updates(self):
+        if not getattr(sys, 'frozen', False): return
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        try:
+            req = urllib.request.Request(UPDATE_INFO_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as res:
+                data = json.loads(res.read().decode('utf-8'))
+                
+            latest_version = data.get("version")
+            download_url = data.get("url")
+            
+            if latest_version and latest_version != CURRENT_VERSION:
+                self.after(0, lambda: self._prompt_update(latest_version, download_url))
+        except Exception:
+            pass 
+
+    def _prompt_update(self, latest_version, download_url):
+        if messagebox.askyesno("アップデート通知", f"新しいバージョン (v{latest_version}) が見つかりました。\n今すぐ自動アップデートしますか？"):
+            self.btn_start.configure(state="disabled")
+            self.btn_stop.configure(state="disabled")
+            self.log(f"v{latest_version} のダウンロードを開始しました...（数秒〜数十秒かかります）")
+            threading.Thread(target=self._download_and_apply_update, args=(download_url, latest_version), daemon=True).start()
+
+    def _download_and_apply_update(self, download_url, latest_version):
+        try:
+            if getattr(sys, 'frozen', False):
+                current_exe = sys.executable
+            else:
+                current_exe = os.path.abspath(sys.argv[0])
+                
+            exe_dir = os.path.dirname(current_exe)
+            new_exe_name = f"TonButton_Autoclick_v{latest_version}.exe"
+            new_exe_path = os.path.join(exe_dir, new_exe_name)
+            
+            req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=60) as res:
+                total_size = int(res.headers.get('Content-Length', 0))
+                downloaded_size = 0
+                
+                with open(new_exe_path, 'wb') as f:
+                    while True:
+                        chunk = res.read(8192)
+                        if not chunk: break
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+            if total_size > 0 and downloaded_size != total_size:
+                raise Exception(f"通信切断 (取得: {downloaded_size}B / 全体: {total_size}B)")
+                
+            self.log("ダウンロード完了。新しいバージョンを起動します...")
+            
+            os.startfile(new_exe_path)
+            self.after(500, self._safe_exit)
+            
+        except Exception as e:
+            self.after(0, lambda: self.log(f"【エラー】アップデート失敗: {e}"))
+            self.after(0, lambda: self.btn_start.configure(state="normal"))
+
+    def _on_closing(self):
+        self._safe_exit()
+
+    def _safe_exit(self):
+        self._save_config()
+        self.stop_event.set()
+        self.after(500, self._final_destroy)
+        
+    def _final_destroy(self):
+        self.destroy()
+        sys.exit(0)
+
+    # ==========================================
+    # 以下、UI構築および各種マクロ処理
+    # ==========================================
+    def _build_ui(self):
+        self.main_container = ctk.CTkScrollableFrame(self)
+        self.main_container.pack(fill="both", expand=True, padx=4, pady=4)
+
+        f_basic = ctk.CTkFrame(self.main_container)
+        f_basic.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(f_basic, text="① 監視ログ", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        row_log = ctk.CTkFrame(f_basic, fg_color="transparent")
+        row_log.pack(fill="x", padx=8, pady=(0, 8))
+        self.entry_log_path = ctk.CTkEntry(row_log, placeholder_text="ログファイルのフルパス", height=28)
+        self.entry_log_path.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(row_log, text="参照...", width=60, height=28, command=self._browse_log_file).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(row_log, text="自動検出", width=70, height=28, fg_color="#3B8ED0", command=self._auto_detect_log).pack(side="left")
+
+        f_main_act = ctk.CTkFrame(self.main_container)
+        f_main_act.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(f_main_act, text="② 自動ボタン押下", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        self.chk_main_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(f_main_act, text="マクロ動作を有効にする (Round was valid. 検知時)", variable=self.chk_main_var).pack(anchor="w", padx=12, pady=(2, 6))
+        grid_main = ctk.CTkFrame(f_main_act, fg_color="transparent")
+        grid_main.pack(fill="x", padx=8, pady=(0, 8))
+        self.val_wait = self._create_param_input(grid_main, 0, 0, "待機時間:", "11.0")
+        self.val_forward = self._create_param_input(grid_main, 0, 1, "前方移動時間:", "2.0")
+        self.val_left = self._create_param_input(grid_main, 0, 2, "左方移動時間:", "0.1")
+
+        f_qol = ctk.CTkFrame(self.main_container)
+        f_qol.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(f_qol, text="③ 便利機能", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        self.chk_standby_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(f_qol, text="【自動停止】60秒間 Round was valid. が無い場合、マクロを一時停止する", variable=self.chk_standby_var).pack(anchor="w", padx=12, pady=(2, 6))
+        self.chk_auto_exec_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(f_qol, text="【自動復帰】Verified 検知時、停止中や待機状態から自動的に実行を再開する", variable=self.chk_auto_exec_var).pack(anchor="w", padx=12, pady=(0, 6))
+        self.chk_speed_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(f_qol, text="【速度テスト】メイン動作終了後、左右に動いてOSC速度をチェックする", variable=self.chk_speed_var).pack(anchor="w", padx=12, pady=(0, 8))
+        
+        grid_qol = ctk.CTkFrame(f_qol, fg_color="transparent")
+        grid_qol.pack(fill="x", padx=8, pady=(0, 8))
+        self.val_test_left = self._create_param_input(grid_qol, 0, 0, "テスト左移動:", "0.5")
+        self.val_test_right = self._create_param_input(grid_qol, 0, 1, "テスト右移動:", "0.5")
+        self.val_punish_thresh = self._create_param_input(grid_qol, 1, 0, "パニッシュの閾値速度:", "4.00")
+        self.val_8page_thresh = self._create_param_input(grid_qol, 1, 1, "8Pageの閾値速度:", "6.5")
+        self.val_back_time = self._create_param_input(grid_qol, 2, 0, "自動復帰動作の後退時間:", "0.5")
+        self.val_max_recovery = self._create_param_input(grid_qol, 2, 1, "自動復帰動作の継続時間:", "30.0")
+        
+        row_mp3_punish = ctk.CTkFrame(f_qol, fg_color="transparent")
+        row_mp3_punish.pack(fill="x", padx=8, pady=(0, 6))
+        ctk.CTkLabel(row_mp3_punish, text="パニッシュ用音声:", width=110, anchor="e", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 4))
+        self.entry_mp3_punish = ctk.CTkEntry(row_mp3_punish, placeholder_text="MP3/WAVファイルのフルパス", height=28)
+        self.entry_mp3_punish.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(row_mp3_punish, text="参照...", width=60, height=28, command=lambda: self._browse_mp3_file(self.entry_mp3_punish)).pack(side="left")
+
+        row_mp3_8page = ctk.CTkFrame(f_qol, fg_color="transparent")
+        row_mp3_8page.pack(fill="x", padx=8, pady=(0, 10))
+        ctk.CTkLabel(row_mp3_8page, text="8Page用音声:", width=110, anchor="e", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 4))
+        self.entry_mp3_8page = ctk.CTkEntry(row_mp3_8page, placeholder_text="MP3/WAVファイルのフルパス", height=28)
+        self.entry_mp3_8page.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(row_mp3_8page, text="参照...", width=60, height=28, command=lambda: self._browse_mp3_file(self.entry_mp3_8page)).pack(side="left")
+
+        f_ctrl = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        f_ctrl.pack(fill="x", padx=4, pady=4)
+        self.btn_start = ctk.CTkButton(f_ctrl, text="▶ 実行開始", height=38, font=ctk.CTkFont(size=15, weight="bold"), fg_color="#2EA043", hover_color="#238636", command=self.start_macro)
+        self.btn_start.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.btn_stop = ctk.CTkButton(f_ctrl, text="⏹ 停止", height=38, font=ctk.CTkFont(size=15, weight="bold"), fg_color="#DA3633", hover_color="#B62324", state="disabled", command=self.stop_macro)
+        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        f_log = ctk.CTkFrame(self.main_container)
+        f_log.pack(fill="both", expand=True, padx=4, pady=(4, 12))
+        log_head = ctk.CTkFrame(f_log, fg_color="transparent")
+        log_head.pack(fill="x", padx=8, pady=(8, 2))
+        ctk.CTkLabel(log_head, text="動作ログ", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        ctk.CTkButton(log_head, text="ログ消去", width=60, height=24, fg_color="#484F58", hover_color="#30363D", command=self._clear_log).pack(side="right")
+        self.txt_console = ctk.CTkTextbox(f_log, wrap="word", height=150, font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_console.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.txt_console.configure(state="disabled")
+
+    def _create_param_input(self, parent, row, col, label_text, default_val):
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.grid(row=row, column=col, padx=4, pady=2, sticky="ew")
+        parent.grid_columnconfigure(col, weight=1)
+        ctk.CTkLabel(cell, text=label_text, font=ctk.CTkFont(size=11), text_color="#A0A0A0").pack(anchor="w")
+        entry = ctk.CTkEntry(cell, height=28, font=ctk.CTkFont(size=13))
+        entry.insert(0, default_val)
+        entry.pack(fill="x", pady=(1, 0))
+        return entry
+
+    def _get_config_path(self):
+        if getattr(sys, 'frozen', False):
+            return os.path.join(os.path.dirname(sys.executable), "TonButton_Config.json")
+        return "TonButton_Config.json"
+
+    def _save_config(self):
+        try:
+            config = {
+                "mp3_punish": self.entry_mp3_punish.get().strip(),
+                "mp3_8page": self.entry_mp3_8page.get().strip(),
+                "log_path": self.entry_log_path.get().strip()
+            }
+            with open(self._get_config_path(), "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+        except Exception: pass
+
+    def _load_config(self):
+        try:
+            path = self._get_config_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f: config = json.load(f)
+                if "mp3_punish" in config:
+                    self.entry_mp3_punish.delete(0, "end")
+                    self.entry_mp3_punish.insert(0, config["mp3_punish"])
+                if "mp3_8page" in config:
+                    self.entry_mp3_8page.delete(0, "end")
+                    self.entry_mp3_8page.insert(0, config["mp3_8page"])
+                if "log_path" in config and os.path.exists(config["log_path"]):
+                    self.entry_log_path.delete(0, "end")
+                    self.entry_log_path.insert(0, config["log_path"])
+        except Exception: pass
+
+    def log(self, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}\n"
+        def _append():
+            self.txt_console.configure(state="normal")
+            self.txt_console.insert("end", formatted)
+            total = int(self.txt_console.index("end-1c").split(".")[0])
+            if total > 500: self.txt_console.delete("1.0", f"{total - 500 + 1}.0")
+            self.txt_console.see("end")
+            self.txt_console.configure(state="disabled")
+        self.after(0, _append)
+
+    def _clear_log(self):
+        self.txt_console.configure(state="normal")
+        self.txt_console.delete("1.0", "end")
+        self.txt_console.configure(state="disabled")
+
+    def _browse_log_file(self):
+        sel = filedialog.askopenfilename(title="output_log を選択", filetypes=[("Text", "output_log_*.txt;*.txt"), ("All", "*.*")])
+        if sel:
+            self.entry_log_path.delete(0, "end")
+            self.entry_log_path.insert(0, sel)
+
+    def _browse_mp3_file(self, entry_widget):
+        sel = filedialog.askopenfilename(title="アラート音声 を選択", filetypes=[("Audio", "*.mp3;*.wav"), ("All", "*.*")])
+        if sel:
+            entry_widget.delete(0, "end")
+            entry_widget.insert(0, sel)
+            self._save_config()
+
+    def _auto_detect_log(self):
+        log_dir = os.path.expandvars(r"%USERPROFILE%\AppData\LocalLow\VRChat\VRChat")
+        files = glob.glob(os.path.join(log_dir, "output_log_*.txt"))
+        if files:
+            latest = max(files, key=os.path.getmtime)
+            self.entry_log_path.delete(0, "end")
+            self.entry_log_path.insert(0, latest)
+            self.log(f"最新ログ検出: {os.path.basename(latest)}")
+
+    def _focus_and_center_mouse(self):
+        hwnd = ctypes.windll.user32.FindWindowW(None, "VRChat")
+        if hwnd:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            time.sleep(0.1)
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            center_x = rect.left + (rect.right - rect.left) // 2
+            center_y = rect.top + (rect.bottom - rect.top) // 2
+            try: pydirectinput.moveTo(center_x, center_y)
+            except Exception: pass
+            time.sleep(0.05)
+            return True
+        return False
+
+    def _safe_sleep(self, seconds, check_stop=True):
+        if not check_stop: return True
+        return not self.stop_event.wait(seconds)
+
+    def _release_all_inputs(self):
+        for key in ('w', 'a', 's', 'd'): pydirectinput.keyUp(key)
+        pydirectinput.mouseUp()
+
+    def _global_watcher_worker(self):
+        f = None
+        current_log = ""
+        while True:
+            if self.is_running or not self.chk_auto_exec_var.get():
+                if f:
+                    f.close()
+                    f = None
+                time.sleep(1.0)
+                continue
+
+            log_path = self.entry_log_path.get().strip()
+            if not log_path or not os.path.exists(log_path):
+                time.sleep(1.0)
+                continue
+
+            if not f or current_log != log_path:
+                try:
+                    f = open(log_path, "r", encoding="utf-8", errors="ignore")
+                    f.seek(0, os.SEEK_END)
+                    current_log = log_path
+                except Exception:
+                    pass
+
+            if f:
+                try:
+                    lines = f.readlines()
+                    for line in lines:
+                        if self.RECOVERY_KEYWORD in line and self.FALSE_POSITIVE_1 not in line and self.FALSE_POSITIVE_2 not in line:
+                            self.log("【自動復帰】Verified を検知したため、マクロを起動します。")
+                            self.after(0, self.start_macro)
+                            f.seek(0, os.SEEK_END)
+                            break
+                except Exception:
+                    pass
+            time.sleep(1.0)
+
+    def start_macro(self):
+        log_path = self.entry_log_path.get().strip()
+        if not os.path.exists(log_path):
+            messagebox.showerror("エラー", "ログファイルが存在しません。")
+            return
+        try:
+            self.p_wait = float(self.val_wait.get())
+            self.p_fwd = float(self.val_forward.get())
+            self.p_left = float(self.val_left.get())
+            self.p_t_left = float(self.val_test_left.get())
+            self.p_t_right = float(self.val_test_right.get())
+            self.p_punish_t = float(self.val_punish_thresh.get())
+            self.p_8page_t = float(self.val_8page_thresh.get())
+            self.p_back_time = float(self.val_back_time.get())
+            self.p_max_recovery = float(self.val_max_recovery.get())
+        except ValueError:
+            messagebox.showerror("エラー", "時間設定には数値を入力してください。")
+            return
+
+        self._save_config()
+        self.is_running = True
+        self.is_standby = False
+        self.stop_event.clear()
+        self.last_valid_time = time.time()
+        
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.log("=== 実行を開始しました ===")
+
+    def stop_macro(self):
+        if not self.is_running: return
+        self.log("停止リクエストを受信。停止中...")
+        self.is_running = False
+        self.stop_event.set()
+        self._release_all_inputs()
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.log("=== 停止しました ===")
+
+    def _integrated_monitor_worker(self):
+        current_log_path = ""
+        f = None
+        last_dir_scan = 0
+        
+        while not self.stop_event.is_set():
+            time.sleep(0.5)
+            
+            target_log = self.entry_log_path.get().strip()
+            
+            if self.chk_auto_exec_var.get() and time.time() - last_dir_scan > 5.0:
+                last_dir_scan = time.time()
+                log_dir = os.path.expandvars(r"%USERPROFILE%\AppData\LocalLow\VRChat\VRChat")
+                files = glob.glob(os.path.join(log_dir, "output_log_*.txt"))
+                if files:
+                    latest_log = max(files, key=os.path.getmtime)
+                    if target_log and latest_log != target_log and os.path.getmtime(latest_log) > os.path.getmtime(target_log):
+                        self.entry_log_path.delete(0, "end")
+                        self.entry_log_path.insert(0, latest_log)
+                        target_log = latest_log
+                        self.log(f"【自動追従】新しいログファイルを検出しました: {os.path.basename(latest_log)}")
+
+            if not target_log or not os.path.exists(target_log): continue
+            
+            if not f or current_log_path != target_log:
+                if f: f.close()
+                try:
+                    f = open(target_log, "r", encoding="utf-8", errors="ignore")
+                    f.seek(0, os.SEEK_END)
+                    current_log_path = target_log
+                except Exception:
+                    f = None
+                    continue
+
+            found_round = False
+            found_verified = False
+            
+            while True:
+                line = f.readline()
+                if not line: break
+                if self.TARGET_KEYWORD in line: found_round = True
+                if self.RECOVERY_KEYWORD in line and self.FALSE_POSITIVE_1 not in line and self.FALSE_POSITIVE_2 not in line:
+                    found_verified = True
+
+            if found_verified:
+                if self.is_standby:
+                    if self.chk_auto_exec_var.get():
+                        self.is_standby = False 
+                        self.log("【ACTIVE】自動復帰モードにより、待機から復帰しました。")
+                        self.last_valid_time = time.time()
+                    else:
+                        self.log("【STANDBY】自動復帰がOFFのため、待機状態を継続します。")
+                elif not self.is_running and self.chk_auto_exec_var.get():
+                    self.log("【自動起動】Verified を検知したため、マクロを起動します。")
+                    self.after(0, self.start_macro)
+                    found_verified = False
+
+            if not self.is_running: continue
+
+            if not self.is_standby and self.chk_standby_var.get():
+                if time.time() - self.last_valid_time >= 60.0:
+                    self.is_standby = True
+                    self.log("【STANDBY】60秒間 Round was valid. がないため一時停止し、自動復帰動作を開始します。")
+                    threading.Thread(target=self._execute_recovery_action, daemon=True).start()
+
+            if not self.is_standby and found_round:
+                self.last_valid_time = time.time()
+                threading.Thread(target=self._execute_main_action, daemon=True).start()
+
+    def _execute_recovery_action(self):
+        if not self.action_lock.acquire(blocking=False): return
+        try:
+            self._focus_and_center_mouse()
+            self.log("自動復帰動作(後退)を実行します...")
+            pydirectinput.keyDown('s')
+            self._safe_sleep(self.p_back_time, self.is_running)
+            pydirectinput.keyUp('s')
+            self._safe_sleep(0.1, self.is_running)
+            
+            rec_start = time.time()
+            is_right = True
+            self.log("自動復帰動作(左右Use連打)を開始します。")
+            
+            while time.time() - rec_start < self.p_max_recovery and self.is_running and self.is_standby:
+                current_key = 'd' if is_right else 'a'
+                pydirectinput.keyDown(current_key)
+                
+                step_end = time.time() + 3.0
+                while time.time() < step_end and self.is_running and self.is_standby:
+                    pydirectinput.mouseDown()
+                    self._safe_sleep(0.05, self.is_running)
+                    pydirectinput.mouseUp()
+                    self._safe_sleep(0.1, self.is_running)
+                
+                pydirectinput.keyUp(current_key)
+                is_right = not is_right
+                
+            self.log("自動復帰動作が終了、または中断されました。")
+        finally:
+            self._release_all_inputs()
+            self.action_lock.release()
+
+    def _execute_main_action(self):
+        if not self.action_lock.acquire(blocking=False): return
+        try:
+            if self.chk_main_var.get():
+                self.log(f"検知: '{self.TARGET_KEYWORD}' -> 自動ボタン押下開始")
+                if not self._safe_sleep(self.p_wait, self.is_running): return
+                
+                self._focus_and_center_mouse()
+                
+                self.log("前方(W)へ移動")
+                pydirectinput.keyDown('w')
+                if not self._safe_sleep(self.p_fwd, self.is_running): return
+                pydirectinput.keyUp('w')
+                if not self._safe_sleep(0.1, self.is_running): return
+                
+                self.log("左方(A)へ移動")
+                pydirectinput.keyDown('a')
+                if not self._safe_sleep(self.p_left, self.is_running): return
+                pydirectinput.keyUp('a')
+                if not self._safe_sleep(0.2, self.is_running): return
+                
+                self.log("オブジェクトをUse (画面中央をクリック)")
+                pydirectinput.mouseDown()
+                self._safe_sleep(0.1, self.is_running)
+                pydirectinput.mouseUp()
+                self.log("自動ボタン押下完了。")
+
+            if self.chk_speed_var.get() and self.is_running:
+                self.log("【速度テスト】左右移動を開始します...")
+                self.is_testing_speed = True
+                self.max_velocity_during_test = 0.0
+                
+                pydirectinput.keyDown('a')
+                if not self._safe_sleep(self.p_t_left, self.is_running): return
+                pydirectinput.keyUp('a')
+                if not self._safe_sleep(0.1, self.is_running): return
+                
+                pydirectinput.keyDown('d')
+                if not self._safe_sleep(self.p_t_right, self.is_running): return
+                pydirectinput.keyUp('d')
+                if not self._safe_sleep(0.1, self.is_running): return
+                
+                self.is_testing_speed = False
+                self.log(f"テスト終了。最大速度: {self.max_velocity_during_test:.3f}")
+                
+                v_max = self.max_velocity_during_test
+                t1 = self.p_punish_t
+                t2 = self.p_8page_t
+                matched = None
+                
+                if v_max < t1 and v_max < t2: matched = "punish" if t1 < t2 else "8page"
+                elif v_max < t1: matched = "punish"
+                elif v_max < t2: matched = "8page"
+                
+                if matched == "punish":
+                    self.log(f"【警告】速度がパニッシュ閾値({t1})未満です。")
+                    play_alert_sound(self.entry_mp3_punish.get().strip())
+                elif matched == "8page":
+                    self.log(f"【警告】速度が8Page閾値({t2})未満です。")
+                    play_alert_sound(self.entry_mp3_8page.get().strip())
+                else:
+                    self.log("速度は正常です。")
+                    
+        finally:
+            self.last_valid_time = time.time()
+            self._release_all_inputs()
+            self.action_lock.release()
+
+    def _osc_worker(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: sock.bind(("127.0.0.1", 9001))
+        except Exception: return
+        sock.settimeout(1.0)
+        
+        target_addr = "/avatar/parameters/VelocityMagnitude"
+        while not self.stop_event.is_set():
+            try:
+                data, _ = sock.recvfrom(1024)
+                val = parse_osc_float(data, target_addr)
+                if val is not None:
+                    self.current_velocity = val
+                    if self.is_testing_speed:
+                        self.max_velocity_during_test = max(self.max_velocity_during_test, val)
+            except socket.timeout: pass
+            except Exception: pass
+        sock.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "build":
+        import subprocess
+        print("\n>>> 自己ビルドモードを開始します...")
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.new('RGB', (256, 256), color='black')
+        draw = ImageDraw.Draw(img)
+        try: font = ImageFont.truetype("arialbd.ttf", 64)
+        except Exception: font = ImageFont.load_default()
+        text = "BEGIN"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((256-w)/2, (256-h)/2 - bbox[1]/2), text, fill="red", font=font)
+        img.save("icon.ico", format="ICO", sizes=[(256, 256)])
+        
+        print(">>> 究極の最適化: 不要ライブラリを徹底除外し、ビルドを実行中...（数分かかります）")
+        add_data_sep = ";" if os.name == "nt" else ":"
+        subprocess.run([
+            sys.executable, "-m", "PyInstaller",
+            "--noconsole", "--onefile", "--clean",
+            "--collect-all", "customtkinter",
+            "--exclude-module", "numpy",
+            "--exclude-module", "pandas",
+            "--exclude-module", "matplotlib",
+            "--exclude-module", "scipy",
+            "--exclude-module", "PyQt5",
+            "--exclude-module", "PySide2",
+            "--exclude-module", "PySide6",
+            "--icon=icon.ico",
+            "--add-data", f"icon.ico{add_data_sep}.",
+            "--name", "TonButton_Autoclick",
+            sys.argv[0]
+        ])
+        
+        if os.path.exists("icon.ico"): os.remove("icon.ico")
+        print("\n>>> 完了！ dist フォルダ内に最強の TonButton_Autoclick.exe が完成しました。")
+        sys.exit(0)
+    else:
+        app = VRCMacroApp()
+        app.mainloop()
