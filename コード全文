@@ -11,6 +11,7 @@ import struct
 import json
 import urllib.request
 import subprocess
+import math  # 【追加】速度計算用
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import pydirectinput
@@ -45,25 +46,37 @@ def play_alert_sound(file_path):
         ctypes.windll.winmm.mciSendStringW('play alert_sound', None, 0, None)
     except Exception: pass
 
-# --- OSCパケット解析 ---
-def parse_osc_float(data, target_addr):
+# --- OSCパケット解析 (【究極進化】複数パラメータ一括取得対応) ---
+def parse_osc_floats(data):
+    results = []
     try:
+        if data.startswith(b'#bundle\x00'):
+            offset = 16
+            while offset < len(data):
+                if offset + 4 > len(data): break
+                size = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                if offset + size > len(data): break
+                results.extend(parse_osc_floats(data[offset:offset+size]))
+                offset += size
+            return results
+
         null_idx = data.find(b'\x00')
-        if null_idx == -1: return None
+        if null_idx == -1: return results
         addr = data[:null_idx].decode('utf-8', 'ignore')
-        if addr != target_addr: return None
         
         align_addr = (null_idx + 4) & ~3
         null_idx_type = data.find(b'\x00', align_addr)
-        if null_idx_type == -1: return None
+        if null_idx_type == -1: return results
         type_tags = data[align_addr:null_idx_type].decode('utf-8', 'ignore')
-        if type_tags != ",f": return None
         
-        align_type = (null_idx_type + 4) & ~3
-        if len(data) >= align_type + 4:
-            return struct.unpack(">f", data[align_type:align_type+4])[0]
+        if type_tags == ",f":
+            align_type = (null_idx_type + 4) & ~3
+            if len(data) >= align_type + 4:
+                val = struct.unpack(">f", data[align_type:align_type+4])[0]
+                results.append((addr, val))
     except Exception: pass
-    return None
+    return results
 
 
 class VRCMacroApp(ctk.CTk):
@@ -82,6 +95,7 @@ class VRCMacroApp(ctk.CTk):
         
         self.is_running = False
         self.stop_event = threading.Event()
+        self.app_exit_event = threading.Event()
         self.action_lock = threading.Lock() 
         self.is_standby = False
         self.last_valid_time = time.time()
@@ -99,7 +113,6 @@ class VRCMacroApp(ctk.CTk):
         self._auto_detect_log()
         self._load_config()
 
-        # 【お掃除機能】起動時に古いEXEを安全に削除
         self._cleanup_old_versions()
 
         self.integrated_monitor_thread = threading.Thread(target=self._integrated_monitor_worker, daemon=True)
@@ -134,7 +147,6 @@ class VRCMacroApp(ctk.CTk):
                             all_cleaned = False
                 if all_cleaned:
                     break
-                    
         threading.Thread(target=cleanup, daemon=True).start()
 
     def _check_for_updates(self):
@@ -149,14 +161,19 @@ class VRCMacroApp(ctk.CTk):
                 
             latest_version = data.get("version")
             download_url = data.get("url")
+            # 【追加】JSONからリリースノート（アップデート内容）を取得。無い場合はデフォルト文
+            release_notes = data.get("release_notes", "システムの最適化と不具合の修正を行いました。")
             
             if latest_version and latest_version != CURRENT_VERSION:
-                self.after(0, lambda: self._prompt_update(latest_version, download_url))
+                self.after(0, lambda: self._prompt_update(latest_version, download_url, release_notes))
         except Exception:
             pass 
 
-    def _prompt_update(self, latest_version, download_url):
-        if messagebox.askyesno("アップデート通知", f"新しいバージョン (v{latest_version}) が見つかりました。\n今すぐ自動アップデートしますか？"):
+    def _prompt_update(self, latest_version, download_url, release_notes):
+        # 【追加】アップデート内容をダイアログ内にポップアウト表示する
+        msg = f"新しいバージョン (v{latest_version}) が見つかりました。\n\n【アップデート内容】\n{release_notes}\n\n今すぐ自動アップデートしますか？"
+        
+        if messagebox.askyesno("アップデート通知", msg):
             self.btn_start.configure(state="disabled")
             self.btn_stop.configure(state="disabled")
             self.log(f"v{latest_version} のダウンロードを開始しました...（数秒〜数十秒かかります）")
@@ -203,6 +220,7 @@ class VRCMacroApp(ctk.CTk):
     def _safe_exit(self):
         self._save_config()
         self.stop_event.set()
+        self.app_exit_event.set()
         self.after(500, self._final_destroy)
         
     def _final_destroy(self):
@@ -371,8 +389,6 @@ class VRCMacroApp(ctk.CTk):
     def _focus_and_center_mouse(self):
         hwnd = ctypes.windll.user32.FindWindowW(None, "VRChat")
         if hwnd:
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-            time.sleep(0.1)
             rect = wintypes.RECT()
             ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
             center_x = rect.left + (rect.right - rect.left) // 2
@@ -394,7 +410,7 @@ class VRCMacroApp(ctk.CTk):
     def _global_watcher_worker(self):
         f = None
         current_log = ""
-        while True:
+        while not self.app_exit_event.is_set():
             if self.is_running or not self.chk_auto_exec_var.get():
                 if f:
                     f.close()
@@ -472,7 +488,7 @@ class VRCMacroApp(ctk.CTk):
         f = None
         last_dir_scan = 0
         
-        while not self.stop_event.is_set():
+        while not self.app_exit_event.is_set():
             time.sleep(0.5)
             
             target_log = self.entry_log_path.get().strip()
@@ -637,24 +653,44 @@ class VRCMacroApp(ctk.CTk):
             self._release_all_inputs()
             self.action_lock.release()
 
+    # --- 【究極進化】OSCワーカー (XYZから速度を自動計算) ---
     def _osc_worker(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
         try: sock.bind(("127.0.0.1", 9001))
         except Exception: return
-        sock.settimeout(1.0)
+        sock.settimeout(0.1)
         
-        target_addr = "/avatar/parameters/VelocityMagnitude"
-        while not self.stop_event.is_set():
+        has_magnitude_param = False
+        vel_x = vel_y = vel_z = 0.0
+        
+        while not self.app_exit_event.is_set():
             try:
-                data, _ = sock.recvfrom(1024)
-                val = parse_osc_float(data, target_addr)
-                if val is not None:
-                    self.current_velocity = val
-                    if self.is_testing_speed:
-                        self.max_velocity_during_test = max(self.max_velocity_during_test, val)
+                data, _ = sock.recvfrom(8192)
+                parsed_params = parse_osc_floats(data)
+                
+                for addr, val in parsed_params:
+                    # アバターに専用パラメータがある場合はそれを優先
+                    if addr == "/avatar/parameters/VelocityMagnitude":
+                        has_magnitude_param = True
+                        self.current_velocity = val
+                    # 無い場合はVRChat標準の各軸の速度を取得して保持
+                    elif not has_magnitude_param:
+                        if addr == "/avatar/parameters/VelocityX": vel_x = val
+                        elif addr == "/avatar/parameters/VelocityY": vel_y = val
+                        elif addr == "/avatar/parameters/VelocityZ": vel_z = val
+                
+                # 専用パラメータが無ければ、X,Y,Zのベクトルから三平方の定理で「実際の移動速度」を計算
+                if not has_magnitude_param:
+                    self.current_velocity = math.sqrt(vel_x**2 + vel_y**2 + vel_z**2)
+                
+                if self.is_testing_speed:
+                    self.max_velocity_during_test = max(self.max_velocity_during_test, self.current_velocity)
+                    
             except socket.timeout: pass
             except Exception: pass
+            
         sock.close()
 
 
