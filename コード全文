@@ -26,7 +26,7 @@ ctk.set_default_color_theme("blue")
 # ==========================================
 # 🔧 【開発者設定】自動アップデート用の設定
 # ==========================================
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.4"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
 # ==========================================
 
@@ -37,8 +37,8 @@ DEFAULT_TIME_PARAMS = {
     "left": 0.1,
     "test_left": 0.5,
     "test_right": 0.5,
-    "punish_thresh": 4.00,
-    "8page_thresh": 6.5,
+    "punish_thresh": 5.00,
+    "8page_thresh": 6.55,
     "back_time": 0.5,
     "max_recovery": 30.0
 }
@@ -96,7 +96,6 @@ class VRCMacroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"TonButton_Autoclick.exe (v{CURRENT_VERSION})")
-        # メイン画面を非常にコンパクトに
         self.geometry("600x450")
         self.minsize(500, 350)
         self.resizable(True, True)
@@ -115,6 +114,9 @@ class VRCMacroApp(ctk.CTk):
         self.action_lock = threading.Lock() 
         self.is_standby = False
         self.last_valid_time = time.time()
+        
+        # パニッシュ時、次回動作を1.66倍にするためのフラグ
+        self.punish_multiplier = 1.0
         
         self.time_params = DEFAULT_TIME_PARAMS.copy()
         
@@ -543,15 +545,25 @@ class VRCMacroApp(ctk.CTk):
                 
                 self._focus_and_center_mouse()
                 
+                # --- パニッシュ検知による1.66倍設定の適用 ---
+                multiplier = self.punish_multiplier
+                self.punish_multiplier = 1.0  # 適用後、倍率をリセットする
+                
+                fwd_time = self.time_params["fwd"] * multiplier
+                left_time = self.time_params["left"] * multiplier
+                
+                if multiplier > 1.0:
+                    self.log(f"【パニッシュ検知後】移動時間を {multiplier}倍 にして実行します。")
+                
                 self.log("前方(W)へ移動")
                 pydirectinput.keyDown('w')
-                if not self._safe_sleep(self.time_params["fwd"], self.is_running): return
+                if not self._safe_sleep(fwd_time, self.is_running): return
                 pydirectinput.keyUp('w')
                 if not self._safe_sleep(0.1, self.is_running): return
                 
                 self.log("左方(A)へ移動")
                 pydirectinput.keyDown('a')
-                if not self._safe_sleep(self.time_params["left"], self.is_running): return
+                if not self._safe_sleep(left_time, self.is_running): return
                 pydirectinput.keyUp('a')
                 if not self._safe_sleep(0.2, self.is_running): return
                 
@@ -595,8 +607,9 @@ class VRCMacroApp(ctk.CTk):
                 elif v_max < t2: matched = "8page"
                 
                 if matched == "punish":
-                    self.log(f"【警告】速度がパニッシュ閾値({t1})未満です。")
+                    self.log(f"【警告】速度がパニッシュ閾値({t1})未満です。次回メイン動作の移動時間を1.66倍します。")
                     play_alert_sound(self.mp3_punish_var.get().strip())
+                    self.punish_multiplier = 1.66  # 次回の移動時間を1.66倍にするフラグを立てる
                 elif matched == "8page":
                     self.log(f"【警告】速度が8Page閾値({t2})未満です。")
                     play_alert_sound(self.mp3_8page_var.get().strip())
