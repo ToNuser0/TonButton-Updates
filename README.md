@@ -15,7 +15,7 @@ VRChatのログ監視とOSC(Velocity)を用いた、ToNのボタン自動押下�
 
 ## 🚀 ダウンロードと使い方の手順
 
-1. [Releasesページ](元ページ右側) にアクセスし、一番上にある最新の `TonButton_Autoclick_vX.X.X.exe` をダウンロードします。
+1. [Releasesページ](https://github.com/ToNuser0/TonButton-Updates/releases) にアクセスし、一番上にある最新の `TonButton_Autoclick_vX.X.X.exe` をダウンロードします。
 2. ダウンロードしたファイルを任意のフォルダに配置し、ダブルクリックで起動します。
    * *※自作ソフトのため、初回起動時にWindowsの青い警告画面（SmartScreen）が出ることがあります。その場合は「詳細情報」をクリックし、「実行」ボタンを押してください。*
 3. マクロ画面が起動したら、VRChatのログファイルを指定し、お好みの時間設定を行って「▶ 実行開始」を押してください。
