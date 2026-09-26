@@ -34,25 +34,6 @@ def resource_path(relative_path):
     except Exception: base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-def create_icon_if_needed():
-    if getattr(sys, 'frozen', False): return
-    icon_path = "icon.ico"
-    if not os.path.exists(icon_path):
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-            img = Image.new('RGB', (256, 256), color='black')
-            draw = ImageDraw.Draw(img)
-            try: font = ImageFont.truetype("arialbd.ttf", 64)
-            except Exception: font = ImageFont.load_default()
-            text = "BEGIN"
-            bbox = draw.textbbox((0, 0), text, font=font)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            draw.text(((256-w)/2, (256-h)/2 - bbox[1]/2), text, fill="red", font=font)
-            img.save(icon_path, format="ICO", sizes=[(256, 256)])
-        except Exception: pass
-
-create_icon_if_needed()
-
 # --- MP3再生 (WinMM使用・非同期・超軽量) ---
 def play_alert_sound(file_path):
     if not os.path.exists(file_path) or not file_path: return
@@ -136,7 +117,6 @@ class VRCMacroApp(ctk.CTk):
     # 🚀 OTAアップデート & お掃除処理
     # ==========================================
     def _cleanup_old_versions(self):
-        """古いバージョンがロック解除されるまでリトライして確実に消す"""
         if not getattr(sys, 'frozen', False): return
         def cleanup():
             current_exe = os.path.abspath(sys.executable)
@@ -679,42 +659,5 @@ class VRCMacroApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "build":
-        import subprocess
-        print("\n>>> 自己ビルドモードを開始します...")
-        from PIL import Image, ImageDraw, ImageFont
-        img = Image.new('RGB', (256, 256), color='black')
-        draw = ImageDraw.Draw(img)
-        try: font = ImageFont.truetype("arialbd.ttf", 64)
-        except Exception: font = ImageFont.load_default()
-        text = "BEGIN"
-        bbox = draw.textbbox((0, 0), text, font=font)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((256-w)/2, (256-h)/2 - bbox[1]/2), text, fill="red", font=font)
-        img.save("icon.ico", format="ICO", sizes=[(256, 256)])
-        
-        print(">>> 究極の最適化: 不要ライブラリを徹底除外し、ビルドを実行中...（数分かかります）")
-        add_data_sep = ";" if os.name == "nt" else ":"
-        subprocess.run([
-            sys.executable, "-m", "PyInstaller",
-            "--noconsole", "--onefile", "--clean",
-            "--collect-all", "customtkinter",
-            "--exclude-module", "numpy",
-            "--exclude-module", "pandas",
-            "--exclude-module", "matplotlib",
-            "--exclude-module", "scipy",
-            "--exclude-module", "PyQt5",
-            "--exclude-module", "PySide2",
-            "--exclude-module", "PySide6",
-            "--icon=icon.ico",
-            "--add-data", f"icon.ico{add_data_sep}.",
-            "--name", "TonButton_Autoclick",
-            sys.argv[0]
-        ])
-        
-        if os.path.exists("icon.ico"): os.remove("icon.ico")
-        print("\n>>> 完了！ dist フォルダ内に最強の TonButton_Autoclick.exe が完成しました。")
-        sys.exit(0)
-    else:
-        app = VRCMacroApp()
-        app.mainloop()
+    app = VRCMacroApp()
+    app.mainloop()
