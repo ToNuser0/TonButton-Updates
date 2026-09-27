@@ -1,4 +1,4 @@
-import os, sys, threading, time, ctypes, socket, struct, json, urllib.request, subprocess, math, glob
+import os, sys, threading, time, ctypes, socket, struct, json, urllib.request, subprocess, math, glob, datetime
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import pydirectinput
@@ -8,7 +8,7 @@ pydirectinput.PAUSE = 0
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-CURRENT_VERSION = "1.0.7"
+CURRENT_VERSION = "1.0.8"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
 
 DEFAULT_TIME_PARAMS = {
@@ -93,7 +93,7 @@ class VRCMacroApp(ctk.CTk):
         self._build_main_ui()
         self._auto_detect_log()
         
-        threading.Thread(target=self._cleanup_old_versions, daemon=True).start()
+        self._cleanup_old_versions()
         threading.Thread(target=self._update_worker, daemon=True).start()
         threading.Thread(target=self._integrated_monitor_worker, daemon=True).start()
         threading.Thread(target=self._osc_worker, daemon=True).start()
@@ -159,21 +159,21 @@ class VRCMacroApp(ctk.CTk):
         txt.insert("1.0", """【TonButton_Autoclick の使用方法】
 
 1. マクロの起動
-画面上部の▶ 実行開始ボタンをクリックしてください。その後、VRChat内でリスポーン以外の方法でラウンドを1回終了させると、本マクロが稼働し始めます。
+画面上部の「▶ 実行開始」ボタンをクリックしてください。その後、VRChat内でリスポーン以外の方法でラウンドを1回終了させると、本マクロが稼働し始めます。
 
 2. マクロの停止
-長時間の休止やマクロを終了する際は、⏹ 停止ボタンをクリックするとすべての機能が停止します。
+長時間の休止やマクロを終了する際は、「⏹ 停止」ボタンをクリックするとすべての機能が停止します。
 
 3. 動作環境についての注意
-本マクロは、VRChatのウィンドウが最前面かつアクティブ（操作中）であることを想定しています。裏画面や別の操作をしている状態では正常に稼働しません。
+本マクロは、VRChatのウィンドウが「最前面」かつ「アクティブ（操作中）」であることを想定しています。裏画面や別の操作をしている状態では正常に稼働しません。
 
-4. 視点の調整について
+4. 視点（カメラ）の調整について
 マクロ動作中はアバターの視点の高さに応じた調整が必要です。
-ビューポイント（視点）が中～高位置のアバターを使用している場合、起動トリガーとなるラウンド終了後、ロビーに着いたタイミングで視点を正面から少し下向きに調整してください。アバターに合わせて適宜微調整をお願いします。
+ビューポイント（視点）が中～高位置のアバターを使用している場合、起動トリガーとなるラウンド終了後、ロビーに着いたタイミングで「視点を正面から少し下向き」に調整してください。アバターに合わせて適宜微調整をお願いします。
 
 5. 放置動作について
-機能の放置稼働補助をオンにすることで、パニッシュ検知時や離席中の続行ラウンドに自動で対応し、完全放置での稼働が可能になります。
-8Pageやパニッシュに対応して手動でアイテム回収を行いたい場合は、放置稼働補助をオフにしてください。オフにすると、速度異常検知時やメイン動作から30秒経過後にマクロが一時的に待機モード（スタンバイ）になり、操作を譲ります。その後、Round was valid.を検知した次のラウンドから再び通常稼働に戻ります。""")
+・機能の「放置稼働補助」をオンにすることで、パニッシュ検知時や離席中の続行ラウンドに自動で対応し、完全放置での稼働が可能になります。
+・8Pageやパニッシュに対応して手動でアイテム回収を行いたい場合は、「放置稼働補助」をオフにしてください。オフにすると、ペナルティ検知時やメイン動作から30秒経過後にマクロが一時的に待機モード（スタンバイ）になり、操作を譲ります。その後、「Round was valid.」を検知した次のラウンドから再び通常稼働に戻ります。""")
         txt.configure(state="disabled")
 
     def _open_settings_dialog(self):
@@ -196,8 +196,8 @@ class VRCMacroApp(ctk.CTk):
             return f
 
         f_toggles = add_section("【動作トグル設定】")
-        ctk.CTkSwitch(f_toggles, text="【放置稼働補助】\n完全放置で稼働するようにする。offであれば半放置で稼働するようになる", variable=self.toggles["standby_resume"]).pack(anchor="w", padx=8, pady=6)
-        ctk.CTkSwitch(f_toggles, text="【速度検知】\nボタン押下後、左右に移動してパニッシュや8Pageを検知する", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=6)
+        ctk.CTkSwitch(f_toggles, text="【放置稼働補助】\n続行ラウンド等で稼働を一時スタンバイさせ、終了時に自動で解除する", variable=self.toggles["standby_resume"]).pack(anchor="w", padx=8, pady=6)
+        ctk.CTkSwitch(f_toggles, text="【速度検知】\nボタン押下後、左右に移動してパニッシュや8Pageを検知する\n(※放置補助OFF時は検知で待機モードへ移行します)", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=6)
         ctk.CTkSwitch(f_toggles, text="【リカバリー】\n長期間ラウンド終了がない場合、左右に移動しボタン押下で復帰を試みる", variable=self.toggles["recovery"]).pack(anchor="w", padx=8, pady=6)
 
         f_times = add_section("【各種時間・閾値設定】")
@@ -238,11 +238,15 @@ class VRCMacroApp(ctk.CTk):
             if "toggles" in c: [self.toggles[k].set(v) for k, v in c["toggles"].items() if k in self.toggles]
         except Exception: pass
 
-    def log(self, msg):
+    # ログ出力機能を安定版に復元（datetimeモジュールとインデックス削除処理の修復）
+    def log(self, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}\n"
         def _append():
             self.txt_console.configure(state="normal")
-            self.txt_console.insert("end", f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
-            if int(self.txt_console.index("end-1c").split(".")[0]) > 500: self.txt_console.delete("1.0", "end-500l")
+            self.txt_console.insert("end", formatted)
+            total = int(self.txt_console.index("end-1c").split(".")[0])
+            if total > 500: self.txt_console.delete("1.0", f"{total - 500 + 1}.0")
             self.txt_console.see("end")
             self.txt_console.configure(state="disabled")
         self.after(0, _append)
@@ -453,12 +457,24 @@ class VRCMacroApp(ctk.CTk):
             except Exception: pass
         sock.close()
 
+    # 安全なクリーンアップロジックの復元
     def _cleanup_old_versions(self):
         if not getattr(sys, 'frozen', False): return
-        current_exe = os.path.abspath(sys.executable)
-        for _ in range(5):
-            time.sleep(2.0)
-            if all((os.remove(f) or self.log(f"【クリーン】旧バージョン削除: {os.path.basename(f)}")) if os.path.abspath(f) != current_exe else True for f in glob.glob(os.path.join(os.path.dirname(current_exe), "TonButton_Autoclick*.exe"))): break
+        def cleanup():
+            current_exe = os.path.abspath(sys.executable)
+            exe_dir = os.path.dirname(current_exe)
+            for _ in range(5):
+                time.sleep(2.0)
+                all_cleaned = True
+                for file in glob.glob(os.path.join(exe_dir, "TonButton_Autoclick*.exe")):
+                    if os.path.abspath(file) != current_exe:
+                        try:
+                            os.remove(file)
+                            self.log(f"【クリーン】旧バージョンを削除しました: {os.path.basename(file)}")
+                        except Exception:
+                            all_cleaned = False
+                if all_cleaned: break
+        threading.Thread(target=cleanup, daemon=True).start()
 
     def _update_worker(self):
         if not getattr(sys, 'frozen', False): return
