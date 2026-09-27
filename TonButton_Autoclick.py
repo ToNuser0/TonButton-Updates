@@ -25,7 +25,7 @@ ctk.set_default_color_theme("blue")
 # ==========================================
 # 🔧 【開発者設定】自動アップデート用の設定
 # ==========================================
-CURRENT_VERSION = "1.0.5"
+CURRENT_VERSION = "1.0.6"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
 # ==========================================
 
@@ -38,6 +38,7 @@ DEFAULT_TIME_PARAMS = {
     "test_right": 0.5,
     "punish_thresh": 5.00,
     "8page_thresh": 6.55,
+    "standby_time": 420.0,  # 7分
     "back_time": 0.5,
     "max_recovery": 30.0
 }
@@ -95,8 +96,8 @@ class VRCMacroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"TonButton_Autoclick.exe (v{CURRENT_VERSION})")
-        self.geometry("600x450")
-        self.minsize(500, 350)
+        self.geometry("600x480")
+        self.minsize(500, 380)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -123,13 +124,11 @@ class VRCMacroApp(ctk.CTk):
         self.log_path_var = ctk.StringVar()
         self.mp3_punish_var = ctk.StringVar()
         self.mp3_8page_var = ctk.StringVar()
+        
         self.toggles = {
-            "main": ctk.BooleanVar(value=True),
-            "standby": ctk.BooleanVar(value=True),
-            "auto_exec": ctk.BooleanVar(value=True),
-            "standby_round": ctk.BooleanVar(value=False),
-            "recovery": ctk.BooleanVar(value=False),
-            "speed": ctk.BooleanVar(value=True)
+            "standby_resume": ctk.BooleanVar(value=True),
+            "speed": ctk.BooleanVar(value=True),
+            "recovery": ctk.BooleanVar(value=False)
         }
         
         # 速度テスト用共有変数
@@ -143,9 +142,6 @@ class VRCMacroApp(ctk.CTk):
         self.osc_last_mag_time = 0.0
         
         self.TARGET_KEYWORD = "Round was valid."
-        self.RECOVERY_KEYWORD = "Verified"
-        self.FALSE_POSITIVE_1 = "checking for Verified account"
-        self.FALSE_POSITIVE_2 = "Verified Round End"
         
         self.settings_window = None
         
@@ -195,6 +191,10 @@ class VRCMacroApp(ctk.CTk):
         self.btn_stop = ctk.CTkButton(f_ctrl, text="⏹ 停止", height=38, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#DA3633", hover_color="#B62324", state="disabled", command=self.stop_macro)
         self.btn_stop.pack(side="left", fill="x", expand=True, padx=(0, 0))
 
+        # 使用方法ボタン
+        btn_help = ctk.CTkButton(container, text="📖 使用方法 (必ずお読みください)", height=32, fg_color="#1F6AA5", hover_color="#144870", command=self._show_help)
+        btn_help.pack(fill="x", pady=(0, 10))
+
         # ③ 動作コンソール
         f_console = ctk.CTkFrame(container)
         f_console.pack(fill="both", expand=True)
@@ -208,6 +208,41 @@ class VRCMacroApp(ctk.CTk):
         self.txt_console.configure(state="disabled")
 
     # ==========================================
+    # 📖 使用方法ポップアップ窓
+    # ==========================================
+    def _show_help(self):
+        help_win = ctk.CTkToplevel(self)
+        help_win.title("使用方法 - TonButton_Autoclick")
+        help_win.geometry("540x420")
+        help_win.attributes("-topmost", True)
+        
+        if os.path.exists(self.icon_path):
+            try: help_win.iconbitmap(self.icon_path)
+            except Exception: pass
+            
+        textbox = ctk.CTkTextbox(help_win, wrap="word", font=ctk.CTkFont(size=13))
+        textbox.pack(fill="both", expand=True, padx=12, pady=12)
+        
+        help_text = """【TonButton_Autoclick の使用方法】
+
+1. マクロの起動
+画面上の▶ 実行開始ボタンをクリックしてください。
+その後、VRChat内でリスポーン以外の方法でラウンドを1回終了させると、自動的にマクロが稼働し始めます。
+
+2. マクロの停止
+長時間ゲームを離れる際や一時的にマクロを終了したい場合は、⏹ 停止ボタンをクリックするとすべての自動操作が停止します。
+
+3. 動作環境についての注意
+本マクロは、VRChatのウィンドウが最前面かつアクティブ（操作中）の状態であることを前提としています。別のウィンドウを操作している裏画面の状態では正常に稼働しません。
+
+4. 視点の調整について
+マクロ動作中は、アバターの視点の高さに応じた調整が必要です。
+ビューポイント（視点）が中～高位置のアバターを使用している場合、マクロ起動のトリガーとなるラウンド終了後、ロビーに戻ったタイミングで視点を正面から下向きに調整してください。アバターに合わせて適宜微調整をお願いします。
+"""
+        textbox.insert("1.0", help_text)
+        textbox.configure(state="disabled")
+
+    # ==========================================
     # ⚙️ UI構築 (設定ポップアップ窓)
     # ==========================================
     def _open_settings_dialog(self):
@@ -217,11 +252,10 @@ class VRCMacroApp(ctk.CTk):
 
         self.settings_window = ctk.CTkToplevel(self)
         self.settings_window.title("各種設定 - TonButton_Autoclick")
-        self.settings_window.geometry("540x600")
+        self.settings_window.geometry("560x580")
         self.settings_window.resizable(True, True)
         self.settings_window.attributes("-topmost", True)
         
-        # 【共通アイコンの設定】
         if os.path.exists(self.icon_path):
             try: self.settings_window.iconbitmap(self.icon_path)
             except Exception: pass
@@ -234,12 +268,9 @@ class VRCMacroApp(ctk.CTk):
         f_toggles = ctk.CTkFrame(scroll)
         f_toggles.pack(fill="x", pady=(0, 12), ipadx=8, ipady=8)
         
-        ctk.CTkSwitch(f_toggles, text="マクロ動作を有効にする (Round was valid. 検知時)", variable=self.toggles["main"]).pack(anchor="w", padx=8, pady=4)
-        ctk.CTkSwitch(f_toggles, text="【自動停止】60秒間 Round was valid. が無い場合、スタンバイ状態にする", variable=self.toggles["standby"]).pack(anchor="w", padx=8, pady=4)
-        ctk.CTkSwitch(f_toggles, text="【自動復帰】スタンバイ中に Verified を検知した際、稼働を再開する", variable=self.toggles["auto_exec"]).pack(anchor="w", padx=8, pady=4)
-        ctk.CTkSwitch(f_toggles, text="【自動停止中の動作】スタンバイ中も Round was valid. でメイン動作を行う", variable=self.toggles["standby_round"]).pack(anchor="w", padx=8, pady=4)
-        ctk.CTkSwitch(f_toggles, text="【リカバリー】スタンバイ移行時、後退と左右Use連打で復帰を試みる", variable=self.toggles["recovery"]).pack(anchor="w", padx=8, pady=4)
-        ctk.CTkSwitch(f_toggles, text="【速度テスト】メイン動作終了後、左右に動いてOSC速度をチェックする", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=4)
+        ctk.CTkSwitch(f_toggles, text="【続行ラウンド待機および稼働復帰】\n続行ラウンドで稼働を一時スタンバイさせ、終了時に自動で解除する", variable=self.toggles["standby_resume"]).pack(anchor="w", padx=8, pady=6)
+        ctk.CTkSwitch(f_toggles, text="【速度検知】\nボタン押下後、左右に移動してパニッシュや8Pageを検知する", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=6)
+        ctk.CTkSwitch(f_toggles, text="【リカバリー】\n長期間ラウンド終了がない場合、左右に移動しボタン押下で復帰を試みる", variable=self.toggles["recovery"]).pack(anchor="w", padx=8, pady=6)
 
         time_entries = {}
         
@@ -251,21 +282,22 @@ class VRCMacroApp(ctk.CTk):
         def add_time_row(parent, key, label):
             row = ctk.CTkFrame(parent, fg_color="transparent")
             row.pack(fill="x", pady=2)
-            ctk.CTkLabel(row, text=label, width=200, anchor="w").pack(side="left", padx=8)
+            ctk.CTkLabel(row, text=label, width=220, anchor="w").pack(side="left", padx=8)
             e = ctk.CTkEntry(row, height=26, width=100)
-            e.insert(0, str(self.time_params[key]))
+            e.insert(0, str(self.time_params.get(key, "")))
             e.pack(side="right", padx=8)
             time_entries[key] = e
 
         add_time_row(f_times, "wait", "待機時間 (秒):")
         add_time_row(f_times, "fwd", "前方移動時間 (秒):")
         add_time_row(f_times, "left", "左方移動時間 (秒):")
-        add_time_row(f_times, "test_left", "速度テスト 左移動 (秒):")
-        add_time_row(f_times, "test_right", "速度テスト 右移動 (秒):")
+        add_time_row(f_times, "standby_time", "スタンバイ移行時間 (秒):")
+        add_time_row(f_times, "test_left", "速度検知 左移動 (秒):")
+        add_time_row(f_times, "test_right", "速度検知 右移動 (秒):")
         add_time_row(f_times, "punish_thresh", "パニッシュ閾値速度:")
         add_time_row(f_times, "8page_thresh", "8Page閾値速度:")
         add_time_row(f_times, "back_time", "リカバリー 後退時間 (秒):")
-        add_time_row(f_times, "max_recovery", "リカバリー 継続時間 (秒):")
+        add_time_row(f_times, "max_recovery", "リカバリー 継続動作時間 (秒):")
 
         # --- 音声設定群 ---
         ctk.CTkLabel(scroll, text="【アラート音声設定】", font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(4, 4))
@@ -336,12 +368,19 @@ class VRCMacroApp(ctk.CTk):
                 self.mp3_8page_var.set(config.get("mp3_8page", ""))
                 
                 if "time_params" in config and isinstance(config["time_params"], dict):
+                    # 古い設定からのマージ（不足キーの補完）
+                    for k, v in DEFAULT_TIME_PARAMS.items():
+                        if k not in config["time_params"]:
+                            config["time_params"][k] = v
                     self.time_params.update(config["time_params"])
                     
                 if "toggles" in config and isinstance(config["toggles"], dict):
                     for k, val in config["toggles"].items():
                         if k in self.toggles:
                             self.toggles[k].set(val)
+                        # 古い設定ファイルからの引き継ぎ
+                        elif k == "standby" and "standby_resume" in self.toggles:
+                            self.toggles["standby_resume"].set(val)
         except Exception: pass
 
     # ==========================================
@@ -447,47 +486,34 @@ class VRCMacroApp(ctk.CTk):
                     continue
 
             found_round = False
-            found_verified = False
             
             while True:
                 line = f.readline()
                 if not line: break
                 if self.TARGET_KEYWORD in line: found_round = True
-                if self.RECOVERY_KEYWORD in line and self.FALSE_POSITIVE_1 not in line and self.FALSE_POSITIVE_2 not in line:
-                    found_verified = True
-
-            # --- 自動復帰処理 ---
-            if found_verified:
-                if self.is_standby:
-                    if self.toggles["auto_exec"].get():
-                        self.is_standby = False 
-                        self.log("【ACTIVE】Verifiedを検知したため、スタンバイ状態から稼働を再開しました。")
-                        self.last_valid_time = time.time()
-                    else:
-                        self.log("【STANDBY】自動復帰がOFFのため、スタンバイ状態を継続します。")
 
             if not self.is_running: continue
 
-            # --- 自動スタンバイ処理 ---
-            if not self.is_standby and self.toggles["standby"].get():
-                if time.time() - self.last_valid_time >= 60.0:
-                    self.is_standby = True
-                    self.log("【STANDBY】60秒間 Round was valid. がないため一時停止します。")
-                    if self.toggles["recovery"].get():
-                        self.log("【リカバリー】押下失敗時のリカバリー動作を開始します。")
-                        threading.Thread(target=self._execute_recovery_action, daemon=True).start()
+            # --- 長期間待機(スタンバイ/リカバリー)の判定 ---
+            if not self.is_standby and time.time() - self.last_valid_time >= self.time_params["standby_time"]:
+                self.is_standby = True
+                
+                if self.toggles["standby_resume"].get():
+                    self.log("【STANDBY】続行ラウンド待機のため、稼働を一時的にスタンバイします。")
+                    
+                if self.toggles["recovery"].get():
+                    self.log("【リカバリー】長期間ラウンド終了が検知されないため、復帰動作を開始します。")
+                    threading.Thread(target=self._execute_recovery_action, daemon=True).start()
 
-            # --- メイン動作実行処理 ---
+            # --- メイン動作 (Round was valid.) ---
             if found_round:
                 if self.is_standby:
-                    if self.toggles["standby_round"].get():
-                        self.log("【ACTIVE】スタンバイ中ですが設定が有効なため、メイン動作を実行しスタンバイを解除します。")
-                        self.is_standby = False
-                        self.last_valid_time = time.time()
-                        threading.Thread(target=self._execute_main_action, daemon=True).start()
-                else:
-                    self.last_valid_time = time.time()
-                    threading.Thread(target=self._execute_main_action, daemon=True).start()
+                    self.is_standby = False
+                    if self.toggles["standby_resume"].get():
+                        self.log("【ACTIVE】ラウンド終了を検知しました。スタンバイを解除して稼働を再開します。")
+                
+                self.last_valid_time = time.time()
+                threading.Thread(target=self._execute_main_action, daemon=True).start()
 
     def _execute_recovery_action(self):
         if not self.action_lock.acquire(blocking=False): return
@@ -516,7 +542,7 @@ class VRCMacroApp(ctk.CTk):
                 pydirectinput.keyUp(current_key)
                 is_right = not is_right
                 
-            self.log("押下失敗時のリカバリー動作が終了、または中断されました。")
+            self.log("リカバリー動作が終了、または中断されました。")
         finally:
             self._release_all_inputs()
             self.action_lock.release()
@@ -524,40 +550,39 @@ class VRCMacroApp(ctk.CTk):
     def _execute_main_action(self):
         if not self.action_lock.acquire(blocking=False): return
         try:
-            if self.toggles["main"].get():
-                self.log(f"検知: '{self.TARGET_KEYWORD}' -> 自動ボタン押下開始")
-                if not self._safe_sleep(self.time_params["wait"], self.is_running): return
-                
-                # --- パニッシュ検知による1.66倍設定の適用 ---
-                multiplier = self.punish_multiplier
-                self.punish_multiplier = 1.0  # 適用後、倍率をリセットする
-                
-                fwd_time = self.time_params["fwd"] * multiplier
-                left_time = self.time_params["left"] * multiplier
-                
-                if multiplier > 1.0:
-                    self.log(f"【パニッシュ検知後】移動時間を {multiplier}倍 にして実行します。")
-                
-                self.log("前方(W)へ移動")
-                pydirectinput.keyDown('w')
-                if not self._safe_sleep(fwd_time, self.is_running): return
-                pydirectinput.keyUp('w')
-                if not self._safe_sleep(0.1, self.is_running): return
-                
-                self.log("左方(A)へ移動")
-                pydirectinput.keyDown('a')
-                if not self._safe_sleep(left_time, self.is_running): return
-                pydirectinput.keyUp('a')
-                if not self._safe_sleep(0.2, self.is_running): return
-                
-                self.log("オブジェクトをUse (クリック)")
-                pydirectinput.mouseDown()
-                self._safe_sleep(0.1, self.is_running)
-                pydirectinput.mouseUp()
-                self.log("自動ボタン押下完了。")
+            self.log(f"検知: '{self.TARGET_KEYWORD}' -> 自動ボタン押下開始")
+            if not self._safe_sleep(self.time_params["wait"], self.is_running): return
+            
+            # --- パニッシュ検知による1.66倍設定の適用 ---
+            multiplier = self.punish_multiplier
+            self.punish_multiplier = 1.0
+            
+            fwd_time = self.time_params["fwd"] * multiplier
+            left_time = self.time_params["left"] * multiplier
+            
+            if multiplier > 1.0:
+                self.log(f"【パニッシュ対応】移動時間を {multiplier}倍 にして実行します。")
+            
+            self.log("前方(W)へ移動")
+            pydirectinput.keyDown('w')
+            if not self._safe_sleep(fwd_time, self.is_running): return
+            pydirectinput.keyUp('w')
+            if not self._safe_sleep(0.1, self.is_running): return
+            
+            self.log("左方(A)へ移動")
+            pydirectinput.keyDown('a')
+            if not self._safe_sleep(left_time, self.is_running): return
+            pydirectinput.keyUp('a')
+            if not self._safe_sleep(0.2, self.is_running): return
+            
+            self.log("オブジェクトをUse (クリック)")
+            pydirectinput.mouseDown()
+            self._safe_sleep(0.1, self.is_running)
+            pydirectinput.mouseUp()
+            self.log("自動ボタン押下完了。")
 
             if self.toggles["speed"].get() and self.is_running:
-                self.log("【速度テスト】左右移動を開始します...")
+                self.log("【速度検知】左右移動を開始します...")
                 self.osc_vel_x = self.osc_vel_y = self.osc_vel_z = self.osc_vel_mag = 0.0
                 
                 self.is_testing_speed = True
@@ -578,7 +603,7 @@ class VRCMacroApp(ctk.CTk):
                 if self.max_velocity_during_test == 0.0:
                     self.log("【警告】最大速度が0.0でした。OSCが受信できていない可能性があります。")
                 else:
-                    self.log(f"テスト終了。最大速度: {self.max_velocity_during_test:.3f}")
+                    self.log(f"検知終了。最大速度: {self.max_velocity_during_test:.3f}")
                 
                 v_max = self.max_velocity_during_test
                 t1 = self.time_params["punish_thresh"]
