@@ -1,4 +1,4 @@
-import os, sys, threading, time, ctypes, socket, struct, json, urllib.request, subprocess, math, glob, datetime
+import os, sys, threading, time, ctypes, socket, struct, json, urllib.request, subprocess, math, glob, datetime, hashlib, queue, re, traceback
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import pydirectinput
@@ -8,18 +8,88 @@ pydirectinput.PAUSE = 0
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-CURRENT_VERSION = "1.0.8"
+CURRENT_VERSION = "1.0.9"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
+
+EXE_BASE_NAME = "TonButton_Autoclick.exe"
+CONFIG_FILE_NAME = "TonButton_Config.json"
+UPDATE_TMP_NAME = "TonButton_Autoclick_update.tmp"
+MUTEX_NAME = "Local\\TonButton_Autoclick_SingleInstance"
 
 DEFAULT_TIME_PARAMS = {
     "wait": 12.0, "fwd": 2.0, "left": 0.12, "standby_time": 420.0,
-    "test_left": 0.6, "test_right": 0.6, "punish_thresh": 5.00, 
-    "8page_thresh": 6.55, "back_time": 0.5, "max_recovery": 30.0
+    "test_left": 0.6, "test_right": 0.6, "punish_thresh": 0.50,
+    "8page_thresh": 0.655, "back_time": 0.5, "max_recovery": 30.0
 }
+
+# 設定ファイルの形式バージョン（2: 速度検知を伏せ状態で行うため、閾値の初期値を1/10に変更）
+CONFIG_VERSION = 2
+# 旧バージョンの閾値初期値（旧初期値のまま使っていた利用者の設定を新初期値へ移行するために使う）
+OLD_DEFAULT_THRESHOLDS = {"punish_thresh": 5.00, "8page_thresh": 6.55}
+
+# 伏せ（Zキー）の入力後、姿勢が切り替わるまで待つ時間（秒）
+PRONE_SETTLE_TIME = 0.3
+
+def get_app_dir():
+    # exe実行時はexeのあるフォルダ、.py実行時はスクリプトのあるフォルダ（起動場所に左右されない）
+    if getattr(sys, 'frozen', False): return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+APP_DIR = get_app_dir()
 
 def resource_path(relative_path):
     try: return os.path.join(sys._MEIPASS, relative_path)
-    except Exception: return os.path.join(os.path.abspath("."), relative_path)
+    except Exception: return os.path.join(APP_DIR, relative_path)
+
+def parse_version(text):
+    # "1.0.13" や "v1.0.13" を (1, 0, 13) に変換。解釈できなければ None
+    try: return tuple(int(part) for part in str(text).strip().lstrip("vV").split("."))
+    except Exception: return None
+
+def is_newer_version(remote, current):
+    r, c = parse_version(remote), parse_version(current)
+    if r is None or c is None: return False
+    length = max(len(r), len(c))
+    r = r + (0,) * (length - len(r))
+    c = c + (0,) * (length - len(c))
+    return r > c
+
+# ---- 多重起動防止（Windowsの名前付きミューテックス） ----
+_instance_mutex = None
+
+def acquire_single_instance():
+    global _instance_mutex
+    if os.name != "nt": return True
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        # アップデート直後は旧プロセスの終了を少し待つ（最大約3秒）
+        for _ in range(6):
+            handle = k32.CreateMutexW(None, False, MUTEX_NAME)
+            if handle and ctypes.get_last_error() != 183:  # 183 = ERROR_ALREADY_EXISTS
+                _instance_mutex = handle
+                return True
+            if handle: k32.CloseHandle(handle)
+            time.sleep(0.5)
+        return False
+    except Exception:
+        return True
+
+def release_single_instance():
+    global _instance_mutex
+    if os.name != "nt" or not _instance_mutex: return
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        k32.CloseHandle(_instance_mutex)
+    except Exception: pass
+    _instance_mutex = None
+
+def show_already_running_message():
+    try: ctypes.windll.user32.MessageBoxW(None, "TonButton_Autoclick は既に起動しています。", "TonButton_Autoclick", 0x30 | 0x40000)
+    except Exception: pass
 
 def play_alert_sound(file_path):
     if not file_path or not os.path.exists(file_path): return
@@ -67,15 +137,25 @@ class VRCMacroApp(ctk.CTk):
         if os.path.exists(self.icon_path):
             try: self.iconbitmap(self.icon_path)
             except Exception: pass
-            
+
+        # 画面操作はすべてこのキュー経由でメインスレッドに渡す（別スレッドからTkを直接触らない）
+        self.ui_queue = queue.Queue()
+        self.config_lock = threading.Lock()
+        self.exe_path = os.path.abspath(sys.executable) if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+
         self.is_running = self.is_standby = self.has_recovered = self.is_testing_speed = False
         self.stop_event, self.app_exit_event, self.action_lock = threading.Event(), threading.Event(), threading.Lock()
-        
+        # リカバリー中断用（ラウンド終了検知・停止・終了時にセット）
+        self.recovery_cancel = threading.Event()
+
         self.last_valid_time = self.last_action_end_time = time.time()
         self.last_event = "valid"
         self.punish_multiplier = 1.0
         self.osc_vel_x = self.osc_vel_y = self.osc_vel_z = self.osc_vel_mag = self.max_velocity_during_test = 0.0
         self.osc_last_mag_time = 0.0
+        self.current_velocity = 0.0
+        self.osc_ever_received = False  # 起動後に一度でもOSCを受信したか
+        self.is_prone = False  # 速度検知のために伏せている最中か
         self.TARGET_KEYWORD = "Round was valid."
         self.settings_window = None
 
@@ -86,25 +166,67 @@ class VRCMacroApp(ctk.CTk):
             "speed": ctk.BooleanVar(value=True),
             "recovery": ctk.BooleanVar(value=False)
         }
-        self.time_vars = {k: ctk.StringVar(value=str(v)) for k, v in self.time_params.items()}
 
         self._load_config()
+        # 別スレッドが参照する設定値のコピー（Tk変数は別スレッドから読まない）
+        self.log_path = self.log_path_var.get().strip()
+        self.mp3_punish = self.mp3_punish_var.get().strip()
+        self.mp3_8page = self.mp3_8page_var.get().strip()
+        self.toggle_values = {k: bool(v.get()) for k, v in self.toggles.items()}
+        # 設定読み込み後に入力欄の変数を作成する（保存値が設定画面に正しく表示されるように）
+        self.time_vars = {k: ctk.StringVar(value=str(self.time_params[k])) for k in DEFAULT_TIME_PARAMS}
         self._bind_immediate_save()
         self._build_main_ui()
+        self.after(50, self._process_ui_queue)
         self._auto_detect_log()
-        
+        # ×ボタンで閉じた場合も終了処理（キー解放・設定保存）を行う
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
         self._cleanup_old_versions()
         threading.Thread(target=self._update_worker, daemon=True).start()
         threading.Thread(target=self._integrated_monitor_worker, daemon=True).start()
         threading.Thread(target=self._osc_worker, daemon=True).start()
 
+    # ---- メインスレッドへの処理受け渡し ----
+    def _run_on_ui(self, func):
+        self.ui_queue.put(func)
+
+    def _process_ui_queue(self):
+        while True:
+            try:
+                func = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func()
+            except Exception:
+                # 1件の画面更新が失敗しても、後続の処理（ログ表示など）は止めない
+                traceback.print_exc()
+        try: self.after(50, self._process_ui_queue)
+        except Exception: pass
+
     def _bind_immediate_save(self):
-        cb = lambda *args: self._save_config()
-        self.log_path_var.trace_add("write", cb)
-        self.mp3_punish_var.trace_add("write", cb)
-        self.mp3_8page_var.trace_add("write", cb)
-        for var in self.toggles.values(): var.trace_add("write", cb)
-        
+        def on_log_path(*args):
+            self.log_path = self.log_path_var.get().strip()
+            self._save_config()
+        def on_mp3_punish(*args):
+            self.mp3_punish = self.mp3_punish_var.get().strip()
+            self._save_config()
+        def on_mp3_8page(*args):
+            self.mp3_8page = self.mp3_8page_var.get().strip()
+            self._save_config()
+        self.log_path_var.trace_add("write", on_log_path)
+        self.mp3_punish_var.trace_add("write", on_mp3_punish)
+        self.mp3_8page_var.trace_add("write", on_mp3_8page)
+
+        for k, var in self.toggles.items():
+            def make_toggle_cb(key=k, v=var):
+                def _cb(*args):
+                    self.toggle_values[key] = bool(v.get())
+                    self._save_config()
+                return _cb
+            var.trace_add("write", make_toggle_cb())
+
         for k, var in self.time_vars.items():
             def make_cb(key=k, v=var):
                 def _cb(*args):
@@ -134,7 +256,7 @@ class VRCMacroApp(ctk.CTk):
         self.btn_stop = ctk.CTkButton(f_ctrl, text="⏹ 停止", height=38, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#DA3633", hover_color="#B62324", state="disabled", command=self.stop_macro)
         self.btn_stop.pack(side="left", fill="x", expand=True)
 
-        ctk.CTkButton(container, text="📖 使用方法 (必ずお読みください)", height=32, fg_color="#1F6AA5", hover_color="#144870", command=self._show_help).pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(container, text="使用方法 (必ずお読みください)", height=32, fg_color="#1F6AA5", hover_color="#144870", command=self._show_help).pack(fill="x", pady=(0, 10))
 
         f_console = ctk.CTkFrame(container)
         f_console.pack(fill="both", expand=True)
@@ -142,38 +264,49 @@ class VRCMacroApp(ctk.CTk):
         head.pack(fill="x", padx=8, pady=(4, 0))
         ctk.CTkLabel(head, text="動作ログ", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
         ctk.CTkButton(head, text="クリア", width=50, height=20, fg_color="transparent", border_width=1, command=lambda: self.txt_console.configure(state="normal") or self.txt_console.delete("1.0", "end") or self.txt_console.configure(state="disabled")).pack(side="right")
-        self.txt_console = ctk.CTkTextbox(f_console, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_console = ctk.CTkTextbox(f_console, wrap="char", font=ctk.CTkFont(family="Consolas", size=12))
         self.txt_console.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.txt_console.configure(state="disabled")
 
     def _show_help(self):
         win = ctk.CTkToplevel(self)
         win.title("使用方法 - TonButton_Autoclick")
-        win.geometry("560x560")
+        win.geometry("620x620")
         win.attributes("-topmost", True)
         if os.path.exists(self.icon_path):
             try: win.iconbitmap(self.icon_path)
             except Exception: pass
-        txt = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(size=13))
+        # 日本語はスペースで区切られないため、単語単位(word)ではなく文字単位(char)で折り返す
+        txt = ctk.CTkTextbox(win, wrap="char", font=ctk.CTkFont(size=13))
+        # 行間を少し広げて読みやすくする（未対応の環境でも表示は続ける）
+        try: txt.configure(spacing2=3, spacing3=4)
+        except Exception: pass
         txt.pack(fill="both", expand=True, padx=12, pady=12)
         txt.insert("1.0", """【TonButton_Autoclick の使用方法】
 
 1. マクロの起動
-画面上部の「▶ 実行開始」ボタンをクリックしてください。その後、VRChat内でリスポーン以外の方法でラウンドを1回終了させると、本マクロが稼働し始めます。
+画面上部の▶ 実行開始ボタンをクリックしてください。その後、VRChat内でリスポーン以外の方法でラウンドを1回終了させると、本マクロが稼働し始めます。
 
 2. マクロの停止
-長時間の休止やマクロを終了する際は、「⏹ 停止」ボタンをクリックするとすべての機能が停止します。
+長時間の休止やマクロを終了する際は、⏹ 停止ボタンをクリックするとすべての機能が停止します。
 
 3. 動作環境についての注意
-本マクロは、VRChatのウィンドウが「最前面」かつ「アクティブ（操作中）」であることを想定しています。裏画面や別の操作をしている状態では正常に稼働しません。
+本マクロは、VRChatのウィンドウが最前面かつアクティブ（操作中）であることを想定しています。裏画面や別の操作をしている状態では正常に稼働しません。
 
-4. 視点（カメラ）の調整について
+4. 視点の調整について
 マクロ動作中はアバターの視点の高さに応じた調整が必要です。
-ビューポイント（視点）が中～高位置のアバターを使用している場合、起動トリガーとなるラウンド終了後、ロビーに着いたタイミングで「視点を正面から少し下向き」に調整してください。アバターに合わせて適宜微調整をお願いします。
+ビューポイント（視点）が中～高位置のアバターを使用している場合、起動トリガーとなるラウンド終了後、ロビーに着いたタイミングで視点を正面から少し下向きに調整してください。アバターに合わせて適宜微調整をお願いします。
 
 5. 放置動作について
-・機能の「放置稼働補助」をオンにすることで、パニッシュ検知時や離席中の続行ラウンドに自動で対応し、完全放置での稼働が可能になります。
-・8Pageやパニッシュに対応して手動でアイテム回収を行いたい場合は、「放置稼働補助」をオフにしてください。オフにすると、ペナルティ検知時やメイン動作から30秒経過後にマクロが一時的に待機モード（スタンバイ）になり、操作を譲ります。その後、「Round was valid.」を検知した次のラウンドから再び通常稼働に戻ります。""")
+・機能の放置稼働補助をオンにすることで、パニッシュ検知時や離席中の続行ラウンドに自動で対応し、完全放置での稼働が可能になります。
+・8Pageやパニッシュに対応して手動でアイテム回収を行いたい場合は、放置稼働補助をオフにしてください。オフにすると、ペナルティ検知時やメイン動作から30秒経過後にマクロが一時的に待機モードになり、操作を譲ります。その後、Round was valid.を検知した次のラウンドから再び通常稼働に戻ります。
+
+6. 速度検知について
+・速度検知では、BEGINボタンを押下した後にZキーで伏せ、左右に移動して移動速度を測定し、再度Zキーで伏せを解除します。測定した速度が閾値を下回った場合、パニッシュまたは8Pageと判定します。
+・閾値の初期値は伏せた状態での移動速度に合わせてあります。VRChatで伏せのキー割り当てを変更している場合は正常に動作しません。
+・速度検知の途中で停止した場合も、伏せは自動で解除されます。
+・速度検知時にOSCを一度も受信できていない場合、速度検知は自動でオフになります。VRChatのOSC設定を確認後、「各種設定」から再度オンにしてください。
+・OSCはポート9001を使用します。同じポートを使う他のOSCアプリと同時には使用できない可能性があります。""")
         txt.configure(state="disabled")
 
     def _open_settings_dialog(self):
@@ -185,7 +318,7 @@ class VRCMacroApp(ctk.CTk):
         if os.path.exists(self.icon_path):
             try: self.settings_window.iconbitmap(self.icon_path)
             except Exception: pass
-            
+
         scroll = ctk.CTkScrollableFrame(self.settings_window)
         scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -197,7 +330,7 @@ class VRCMacroApp(ctk.CTk):
 
         f_toggles = add_section("【動作トグル設定】")
         ctk.CTkSwitch(f_toggles, text="【放置稼働補助】\n続行ラウンド等で稼働を一時スタンバイさせ、終了時に自動で解除する", variable=self.toggles["standby_resume"]).pack(anchor="w", padx=8, pady=6)
-        ctk.CTkSwitch(f_toggles, text="【速度検知】\nボタン押下後、左右に移動してパニッシュや8Pageを検知する\n(※放置補助OFF時は検知で待機モードへ移行します)", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=6)
+        ctk.CTkSwitch(f_toggles, text="【速度検知】\nボタン押下後、伏せたのち、左右に移動してパニッシュや8Pageを検知する\n(※放置補助OFF時は検知で待機モードへ移行します)", variable=self.toggles["speed"]).pack(anchor="w", padx=8, pady=6)
         ctk.CTkSwitch(f_toggles, text="【リカバリー】\n長期間ラウンド終了がない場合、左右に移動しボタン押下で復帰を試みる", variable=self.toggles["recovery"]).pack(anchor="w", padx=8, pady=6)
 
         f_times = add_section("【各種時間・閾値設定】")
@@ -219,29 +352,60 @@ class VRCMacroApp(ctk.CTk):
 
         ctk.CTkButton(scroll, text="閉じる", height=38, font=ctk.CTkFont(weight="bold"), fg_color="#484F58", hover_color="#30363D", command=self.settings_window.destroy).pack(fill="x", padx=12, pady=12)
 
-    def _get_config_path(self): return os.path.join(os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else "", "TonButton_Config.json")
+    # ---- 設定ファイル ----
+    def _get_config_path(self): return os.path.join(APP_DIR, CONFIG_FILE_NAME)
 
     def _save_config(self):
-        try:
-            with open(self._get_config_path(), "w", encoding="utf-8") as f:
-                json.dump({"log_path": self.log_path_var.get().strip(), "mp3_punish": self.mp3_punish_var.get().strip(), "mp3_8page": self.mp3_8page_var.get().strip(), "time_params": self.time_params, "toggles": {k: v.get() for k, v in self.toggles.items()}}, f, ensure_ascii=False, indent=4)
-        except Exception: pass
+        data = {
+            "config_version": CONFIG_VERSION,
+            "log_path": self.log_path,
+            "mp3_punish": self.mp3_punish,
+            "mp3_8page": self.mp3_8page,
+            "time_params": dict(self.time_params),
+            "toggles": dict(self.toggle_values)
+        }
+        with self.config_lock:
+            path = self._get_config_path()
+            tmp_path = path + ".tmp"
+            try:
+                # 一時ファイルに書き切ってから置き換える（書き込み途中で壊れないように）
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                os.replace(tmp_path, path)
+            except Exception: pass
 
     def _load_config(self):
-        if not os.path.exists(self._get_config_path()): return
+        path = self._get_config_path()
+        if not os.path.exists(path): return
         try:
-            with open(self._get_config_path(), "r", encoding="utf-8") as f: c = json.load(f)
-            self.log_path_var.set(c.get("log_path", ""))
-            self.mp3_punish_var.set(c.get("mp3_punish", ""))
-            self.mp3_8page_var.set(c.get("mp3_8page", ""))
-            if "time_params" in c: self.time_params.update(c["time_params"])
-            if "toggles" in c: [self.toggles[k].set(v) for k, v in c["toggles"].items() if k in self.toggles]
-        except Exception: pass
+            with open(path, "r", encoding="utf-8") as f: c = json.load(f)
+            self.log_path_var.set(str(c.get("log_path", "")))
+            self.mp3_punish_var.set(str(c.get("mp3_punish", "")))
+            self.mp3_8page_var.set(str(c.get("mp3_8page", "")))
+            for k, v in c.get("time_params", {}).items():
+                if k in DEFAULT_TIME_PARAMS:
+                    try: self.time_params[k] = float(v)
+                    except (TypeError, ValueError): pass
+            # 旧形式の設定で、閾値が旧初期値のままなら新初期値に移行する（独自に変更した値はそのまま）
+            if c.get("config_version", 1) < 2:
+                for k, old_default in OLD_DEFAULT_THRESHOLDS.items():
+                    if self.time_params.get(k) == old_default:
+                        self.time_params[k] = DEFAULT_TIME_PARAMS[k]
+                        self.log(f"【設定移行】{k} を新しい初期値 {DEFAULT_TIME_PARAMS[k]} に変更しました")
+            for k, v in c.get("toggles", {}).items():
+                if k in self.toggles: self.toggles[k].set(bool(v))
+        except Exception:
+            # 壊れた設定ファイルは上書きせずに退避しておく
+            try: os.replace(path, path + ".broken")
+            except Exception: pass
+            self.log("【注意】設定ファイルを読み込めなかったため、初期設定で起動しました。(元のファイルは TonButton_Config.json.broken として保存しました)")
 
-    # ログ出力機能を安定版に復元（datetimeモジュールとインデックス削除処理の修復）
+    # ---- ログ出力（安定版。過度な最適化をしないこと） ----
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {message}\n"
+        # 文末の句点・読点（。、）は表示しない
+        text = str(message).rstrip("。、")
+        formatted = f"[{timestamp}] {text}\n"
         def _append():
             self.txt_console.configure(state="normal")
             self.txt_console.insert("end", formatted)
@@ -249,7 +413,7 @@ class VRCMacroApp(ctk.CTk):
             if total > 500: self.txt_console.delete("1.0", f"{total - 500 + 1}.0")
             self.txt_console.see("end")
             self.txt_console.configure(state="disabled")
-        self.after(0, _append)
+        self._run_on_ui(_append)
 
     def _browse_log_file(self):
         if sel := filedialog.askopenfilename(title="output_log を選択", filetypes=[("Text", "output_log_*.txt;*.txt"), ("All", "*.*")]): self.log_path_var.set(sel)
@@ -262,13 +426,20 @@ class VRCMacroApp(ctk.CTk):
             self.log(f"最新ログ検出: {os.path.basename(latest)}")
 
     def _safe_sleep(self, sec): return not self.stop_event.wait(sec)
-    def _release_all_inputs(self): [pydirectinput.keyUp(k) for k in ('w', 'a', 's', 'd')]; pydirectinput.mouseUp()
+
+    # リカバリー専用の待機。ラウンド終了検知・停止・終了のいずれかで即座に False を返す
+    def _recovery_sleep(self, sec):
+        if self.recovery_cancel.wait(sec): return False
+        return not self.stop_event.is_set()
+
+    def _release_all_inputs(self): [pydirectinput.keyUp(k) for k in ('w', 'a', 's', 'd', 'z')]; pydirectinput.mouseUp()
 
     def start_macro(self):
         if not os.path.exists(self.log_path_var.get().strip()): return messagebox.showerror("エラー", "正しいログファイルを指定してください。")
         self._save_config()
         self.is_running, self.is_standby, self.has_recovered = True, False, False
         self.stop_event.clear()
+        self.recovery_cancel.clear()
         self.last_valid_time = self.last_action_end_time = time.time()
         self.last_event = "valid"
         self.btn_start.configure(state="disabled")
@@ -279,6 +450,7 @@ class VRCMacroApp(ctk.CTk):
         if not self.is_running: return
         self.is_running = False
         self.stop_event.set()
+        self.recovery_cancel.set()
         self._release_all_inputs()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
@@ -288,18 +460,21 @@ class VRCMacroApp(ctk.CTk):
         cur_log, f, last_scan = "", None, 0
         while not self.app_exit_event.is_set():
             time.sleep(0.5)
-            target = self.log_path_var.get().strip()
-            
+            target = self.log_path
+
             if time.time() - last_scan > 5.0:
                 last_scan = time.time()
                 files = glob.glob(os.path.expandvars(r"%USERPROFILE%\AppData\LocalLow\VRChat\VRChat\output_log_*.txt"))
-                if files and (latest := max(files, key=os.path.getmtime)) != target and (not target or os.path.getmtime(latest) > os.path.getmtime(target)):
-                    self.log_path_var.set(latest)
-                    target = latest
-                    self.log(f"【自動追従】新しいログファイルを検出しました: {os.path.basename(latest)}")
+                try:
+                    if files and (latest := max(files, key=os.path.getmtime)) != target and (not target or not os.path.exists(target) or os.path.getmtime(latest) > os.path.getmtime(target)):
+                        target = latest
+                        self.log_path = latest
+                        self._run_on_ui(lambda p=latest: self.log_path_var.set(p))
+                        self.log(f"【自動追従】新しいログファイルを検出しました: {os.path.basename(latest)}")
+                except OSError: pass
 
             if not target or not os.path.exists(target): continue
-            
+
             if not f or cur_log != target:
                 if f: f.close()
                 try:
@@ -316,71 +491,91 @@ class VRCMacroApp(ctk.CTk):
             # 30秒でのラウンド間スタンバイ (無条件: アクション後30秒で移行)
             if not self.is_standby and self.last_event == "action" and e_act >= 30.0:
                 self.is_standby = True
-                self.log("【STANDBY】ラウンド間の待機モードに移行しました。")
+                self.log("【STANDBY】ラウンド間の待機モードに移行しました")
 
-            # リカバリー発動 (長期間未検知)
+            # リカバリー発動 (長期間未検知・1回のみ)
             if not self.has_recovered and e_val >= self.time_params["standby_time"]:
                 self.has_recovered = True
-                if self.toggles["recovery"].get():
-                    self.log("【リカバリー】長期間応答がないため、復帰動作を開始します。")
+                if self.toggle_values["recovery"]:
+                    self.log("【リカバリー】長期間応答がないため、復帰動作を開始します")
+                    self.recovery_cancel.clear()
                     threading.Thread(target=self._execute_recovery_action, daemon=True).start()
 
             # メイン動作
             if found_round:
+                # リカバリー中であれば即座に中断させる
+                self.recovery_cancel.set()
                 self.has_recovered = False
                 should_execute = True
                 if self.is_standby:
                     self.is_standby = False
-                    if self.toggles["standby_resume"].get():
-                        self.log("【ACTIVE】ラウンド終了検知。放置補助ONのため待機モードを解除し稼働します。")
+                    if self.toggle_values["standby_resume"]:
+                        self.log("【ACTIVE】ラウンド終了検知。放置補助ONのため待機モードを解除し稼働します")
                     else:
                         self.log("【ACTIVE】ラウンド終了検知。待機モードを解除しました。(次回ラウンドから通常稼働)")
                         should_execute = False
-                
+
                 self.last_valid_time = time.time()
                 self.last_event = "valid"
                 if should_execute: threading.Thread(target=self._execute_main_action, daemon=True).start()
 
     def _execute_recovery_action(self):
         if not self.action_lock.acquire(blocking=False): return
+        ok = True
         try:
             self.log("リカバリー動作(後退)を実行します...")
             pydirectinput.keyDown('s')
-            if not self._safe_sleep(self.time_params["back_time"]): return
+            ok = self._recovery_sleep(self.time_params["back_time"])
             pydirectinput.keyUp('s')
-            if not self._safe_sleep(0.1): return
-            
-            self.log("リカバリー動作(左右Use連打)を開始します。")
-            rec_start, is_right = time.time(), True
-            while time.time() - rec_start < self.time_params["max_recovery"] and self.is_running and self.is_standby:
-                key = 'd' if is_right else 'a'
-                pydirectinput.keyDown(key)
-                step_end = time.time() + 3.0
-                while time.time() < step_end and self.is_running and self.is_standby:
-                    pydirectinput.mouseDown()
-                    if not self._safe_sleep(0.05): return
-                    pydirectinput.mouseUp()
-                    if not self._safe_sleep(0.1): return
-                pydirectinput.keyUp(key)
-                is_right = not is_right
-            self.log("リカバリー動作が終了、または中断されました。")
+            if ok: ok = self._recovery_sleep(0.1)
+
+            if ok:
+                self.log("リカバリー動作(左右Use連打)を開始します")
+                rec_start, is_right = time.time(), True
+                max_rec = self.time_params["max_recovery"]
+                while ok and time.time() - rec_start < max_rec:
+                    key = 'd' if is_right else 'a'
+                    pydirectinput.keyDown(key)
+                    step_end = time.time() + 3.0
+                    while ok and time.time() < step_end and time.time() - rec_start < max_rec:
+                        pydirectinput.mouseDown()
+                        ok = self._recovery_sleep(0.05)
+                        pydirectinput.mouseUp()
+                        if ok: ok = self._recovery_sleep(0.1)
+                    pydirectinput.keyUp(key)
+                    is_right = not is_right
+
+            if ok:
+                self.log("リカバリー動作が継続時間の上限に達したため終了しました")
+            elif self.is_running and not self.app_exit_event.is_set():
+                self.log("【リカバリー】ラウンド終了を検知したため、リカバリーを終了します")
+            else:
+                self.log("リカバリー動作が停止により中断されました")
         finally:
             self._release_all_inputs()
             self.action_lock.release()
 
     def _execute_main_action(self):
-        if not self.action_lock.acquire(blocking=False): return
+        # リカバリー終了直後でもロック解放を待ってから実行する（既にメイン動作中なら重複実行しない）
+        if not self.action_lock.acquire(timeout=2.0): return
         try:
             self.log(f"検知: '{self.TARGET_KEYWORD}' -> 自動ボタン押下開始")
             if not self._safe_sleep(self.time_params["wait"]): return
-            
+
             mul = self.punish_multiplier
             self.punish_multiplier = 1.0
-            if mul > 1.0: self.log(f"【パニッシュ対応】移動時間を {mul}倍 にして実行します。")
-            
+            if mul > 1.0: self.log(f"【パニッシュ対応】移動時間を {mul}倍 にして実行します")
+
             def move(key, dur):
                 pydirectinput.keyDown(key)
                 res = self._safe_sleep(dur)
+                pydirectinput.keyUp(key)
+                return res
+
+            def tap(key):
+                # 短く1回押す（VRChatが確実に認識できるよう、押下時間を0.05秒確保する）
+                pydirectinput.keyDown(key)
+                res = self._safe_sleep(0.05)
                 pydirectinput.keyUp(key)
                 return res
 
@@ -388,42 +583,66 @@ class VRCMacroApp(ctk.CTk):
             if not move('w', self.time_params["fwd"] * mul) or not self._safe_sleep(0.1): return
             self.log("左方(A)へ移動")
             if not move('a', self.time_params["left"] * mul) or not self._safe_sleep(0.2): return
-            
-            self.log("オブジェクトをUse (クリック)")
+
+            self.log("BEGINボタンを押下")
             pydirectinput.mouseDown()
             if not self._safe_sleep(0.1): return
             pydirectinput.mouseUp()
-            self.log("自動ボタン押下完了。")
+            self.log("自動ボタン押下完了")
 
-            if self.toggles["speed"].get():
-                self.log("【速度検知】左右移動を開始します...")
+            if self.toggle_values["speed"]:
+                self.log("【速度検知】伏せたのち左右移動を開始します...")
                 self.osc_vel_x = self.osc_vel_y = self.osc_vel_z = self.osc_vel_mag = self.max_velocity_during_test = 0.0
+
+                # 伏せる（Zキー）→ 姿勢が切り替わるまで待つ
+                self.is_prone = True
+                if not tap('z') or not self._safe_sleep(PRONE_SETTLE_TIME): return
                 self.is_testing_speed = True
-                
+
                 if not move('d', self.time_params["test_right"]) or not self._safe_sleep(0.1): return
                 if not move('a', self.time_params["test_left"]) or not self._safe_sleep(0.1): return
                 self.is_testing_speed = False
-                
+
+                # 伏せを解除する（Zキー）
+                self.is_prone = False
+                if not tap('z'): return
+
                 v = self.max_velocity_during_test
-                if v == 0.0: self.log("【警告】最大速度が0.0でした。OSCが受信できていない可能性があります。")
-                else: self.log(f"検知終了。最大速度: {v:.3f}")
-                
-                t1, t2 = self.time_params["punish_thresh"], self.time_params["8page_thresh"]
-                matched = "punish" if v < t1 and v < t2 else "8page" if v < t2 else None
-                
-                if matched:
-                    play_alert_sound(self.mp3_punish_var.get().strip() if matched == "punish" else self.mp3_8page_var.get().strip())
-                    if not self.toggles["standby_resume"].get():
-                        self.log(f"【警告】速度が{matched}閾値未満。放置補助OFFのため待機モードに移行します。")
-                        self.punish_multiplier = 1.0
-                        self.is_standby = True
-                    else:
-                        if matched == "punish":
-                            self.log(f"【警告】速度がパニッシュ閾値未満。次回メイン動作の移動時間を1.66倍します。")
-                            self.punish_multiplier = 1.66
-                        else: self.log(f"【警告】速度が8Page閾値未満です。")
-                else: self.log("速度は正常です。")
+                if v == 0.0 and not self.osc_ever_received:
+                    # 起動後一度もOSCを受信していない場合のみ、速度検知を自動でオフにする
+                    self.log("【警告】OSCが受信できないため速度検知をオフにします")
+                    self.toggle_values["speed"] = False
+                    self._run_on_ui(lambda: self.toggles["speed"].set(False))
+                elif v == 0.0:
+                    # OSCは届いているが動けなかった（壁に挟まった等）場合はペナルティ判定しない
+                    self.log("【警告】最大速度が0.0でした。移動できなかった可能性があるため、今回のペナルティ判定は行いません")
+                else:
+                    self.log(f"検知終了。最大速度: {v:.3f}")
+
+                    t1, t2 = self.time_params["punish_thresh"], self.time_params["8page_thresh"]
+                    matched = "punish" if v < t1 and v < t2 else "8page" if v < t2 else None
+
+                    if matched:
+                        play_alert_sound(self.mp3_punish if matched == "punish" else self.mp3_8page)
+                        if not self.toggle_values["standby_resume"]:
+                            self.log(f"【警告】速度が{matched}閾値未満。放置補助OFFのため待機モードに移行します")
+                            self.punish_multiplier = 1.0
+                            self.is_standby = True
+                        else:
+                            if matched == "punish":
+                                self.log(f"【警告】速度がパニッシュ閾値未満。次回メイン動作の移動時間を1.66倍します")
+                                self.punish_multiplier = 1.66
+                            else: self.log(f"【警告】速度が8Page閾値未満です")
+                    else: self.log("速度は正常です")
         finally:
+            self.is_testing_speed = False
+            # 停止などで速度検知が中断された場合も、伏せたままにしない
+            if self.is_prone:
+                self.is_prone = False
+                pydirectinput.keyDown('z')
+                time.sleep(0.05)
+                pydirectinput.keyUp('z')
+                self.log("【速度検知】中断されたため、伏せを解除しました")
             self.last_action_end_time = time.time()
             self.last_event = "action"
             self._release_all_inputs()
@@ -431,87 +650,170 @@ class VRCMacroApp(ctk.CTk):
 
     def _osc_worker(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEADDR は使わない（Windowsでは他アプリと黙ってポートを共有してしまい、受信できなくなるため）
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-        try: 
+        try:
             sock.bind(("0.0.0.0", 9001))
-            self.after(1000, lambda: self.log("【OSC】ポート9001での受信待機を開始しました。"))
-        except Exception as e: return self.after(1000, lambda: self.log(f"【OSCエラー】ポートのバインドに失敗しました。({e})"))
-            
+            self.log("【OSC】ポート9001での受信待機を開始しました")
+        except Exception as e:
+            self.log(f"【OSCエラー】ポート9001のバインドに失敗しました。他のOSCアプリがポートを使用している可能性があります。({e})")
+            sock.close()
+            return
+
         sock.settimeout(0.1)
-        first_receive = True
         while not self.app_exit_event.is_set():
             try:
                 data, _ = sock.recvfrom(65536)
-                if first_receive:
-                    self.after(0, lambda: self.log("【OSC】VRChatからのOSC初回到達を確認しました。"))
-                    first_receive = False
+                if not self.osc_ever_received:
+                    self.osc_ever_received = True
+                    self.log("【OSC】VRChatからのOSC初回到達を確認しました")
                 for addr, val in parse_osc_floats(data):
                     if addr == "/avatar/parameters/VelocityMagnitude": self.osc_vel_mag = val; self.osc_last_mag_time = time.time()
                     elif addr == "/avatar/parameters/VelocityX": self.osc_vel_x = val
                     elif addr == "/avatar/parameters/VelocityY": self.osc_vel_y = val
                     elif addr == "/avatar/parameters/VelocityZ": self.osc_vel_z = val
-                
+
                 self.current_velocity = self.osc_vel_mag if time.time() - self.osc_last_mag_time < 2.0 else math.sqrt(self.osc_vel_x**2 + self.osc_vel_y**2 + self.osc_vel_z**2)
                 if self.is_testing_speed: self.max_velocity_during_test = max(self.max_velocity_during_test, self.current_velocity)
             except Exception: pass
         sock.close()
 
-    # 安全なクリーンアップロジックの復元
+    # ---- 旧バージョンの後片付け ----
+    def _old_version_files(self):
+        exe_dir = os.path.dirname(self.exe_path)
+        current = os.path.normcase(os.path.abspath(self.exe_path))
+        candidates = set(glob.glob(os.path.join(exe_dir, "TonButton_Autoclick*.exe.old")))
+        candidates.add(os.path.join(exe_dir, UPDATE_TMP_NAME))
+        # v1.0.12以前の方式で更新された場合（自分が _vX.X.X.exe 名で起動している場合）のみ、旧ファイルを削除対象にする
+        if re.fullmatch(r"TonButton_Autoclick_v[\d.]+\.exe", os.path.basename(self.exe_path), re.IGNORECASE):
+            candidates.update(glob.glob(os.path.join(exe_dir, "TonButton_Autoclick_v*.exe")))
+            candidates.add(os.path.join(exe_dir, EXE_BASE_NAME))
+        return [p for p in candidates if os.path.exists(p) and os.path.normcase(os.path.abspath(p)) != current]
+
+    def _restore_standard_exe_name(self):
+        # 旧方式の更新で付いたバージョン入りの名前を、元の名前に戻す（ショートカットが切れないように）
+        name = os.path.basename(self.exe_path)
+        if not re.fullmatch(r"TonButton_Autoclick_v[\d.]+\.exe", name, re.IGNORECASE): return
+        dest = os.path.join(os.path.dirname(self.exe_path), EXE_BASE_NAME)
+        if os.path.exists(dest): return
+        try:
+            os.replace(self.exe_path, dest)
+            self.exe_path = dest
+            self.log(f"【クリーン】ファイル名を {EXE_BASE_NAME} に戻しました")
+        except Exception: pass
+
     def _cleanup_old_versions(self):
         if not getattr(sys, 'frozen', False): return
         def cleanup():
-            current_exe = os.path.abspath(sys.executable)
-            exe_dir = os.path.dirname(current_exe)
-            for _ in range(5):
+            all_cleaned = False
+            for _ in range(10):
                 time.sleep(2.0)
                 all_cleaned = True
-                for file in glob.glob(os.path.join(exe_dir, "TonButton_Autoclick*.exe")):
-                    if os.path.abspath(file) != current_exe:
-                        try:
-                            os.remove(file)
-                            self.log(f"【クリーン】旧バージョンを削除しました: {os.path.basename(file)}")
-                        except Exception:
-                            all_cleaned = False
+                for file in self._old_version_files():
+                    try:
+                        os.remove(file)
+                        self.log(f"【クリーン】旧バージョンを削除しました: {os.path.basename(file)}")
+                    except Exception:
+                        all_cleaned = False
                 if all_cleaned: break
+            if all_cleaned: self._restore_standard_exe_name()
         threading.Thread(target=cleanup, daemon=True).start()
 
+    # ---- 自動アップデート ----
     def _update_worker(self):
         if not getattr(sys, 'frozen', False): return
         try:
             with urllib.request.urlopen(urllib.request.Request(UPDATE_INFO_URL, headers={'User-Agent': 'Mozilla/5.0'}), timeout=5) as res:
                 data = json.loads(res.read().decode('utf-8'))
-            if data.get("version") and data.get("version") != CURRENT_VERSION:
-                self.after(0, lambda: self._prompt_update(data.get("version"), data.get("url"), data.get("release_notes", "")))
-        except Exception: pass 
+            remote = data.get("version")
+            # 配信版が現在より新しい場合のみ通知する（テストビルドで旧版を勧めないように）
+            if remote and is_newer_version(remote, CURRENT_VERSION):
+                self._run_on_ui(lambda: self._prompt_update(remote, data.get("url"), data.get("release_notes", ""), data.get("sha256", "")))
+        except Exception: pass
 
-    def _prompt_update(self, version, url, notes):
+    def _prompt_update(self, version, url, notes, sha256):
         if messagebox.askyesno("アップデート通知", f"新しいバージョン (v{version}) が見つかりました。\n\n【アップデート内容】\n{notes}\n\n今すぐ自動アップデートしますか？"):
             self.btn_start.configure(state="disabled")
             self.btn_stop.configure(state="disabled")
             self.log(f"v{version} のダウンロードを開始しました...")
-            threading.Thread(target=self._download_and_apply_update, args=(url, version), daemon=True).start()
+            threading.Thread(target=self._download_and_apply_update, args=(url, version, sha256), daemon=True).start()
 
-    def _download_and_apply_update(self, download_url, version):
+    def _swap_in_new_exe(self, tmp_path, version):
+        # 実行中のexeを .old にリネームし、新しいexeを同じ名前で配置する（ショートカットを維持）
+        current = self.exe_path
+        old_path = current + ".old"
         try:
-            new_exe = os.path.join(os.path.dirname(sys.executable), f"TonButton_Autoclick_v{version}.exe")
+            if os.path.exists(old_path):
+                try: os.remove(old_path)
+                except Exception: pass
+            os.replace(current, old_path)
+            try:
+                os.replace(tmp_path, current)
+            except Exception:
+                os.replace(old_path, current)  # 失敗したら元に戻す
+                raise
+            return current
+        except Exception:
+            # リネームできない環境では従来どおりバージョン入りの名前で配置する
+            fallback = os.path.join(os.path.dirname(current), f"TonButton_Autoclick_v{version}.exe")
+            os.replace(tmp_path, fallback)
+            return fallback
+
+    def _download_and_apply_update(self, download_url, version, expected_sha256):
+        tmp_path = os.path.join(os.path.dirname(self.exe_path), UPDATE_TMP_NAME)
+        try:
+            if not expected_sha256:
+                raise Exception("配信情報に検証用ハッシュ(sha256)が含まれていないため中止しました")
+            hasher = hashlib.sha256()
             with urllib.request.urlopen(urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=60) as res:
                 total, downloaded = int(res.headers.get('Content-Length', 0)), 0
-                with open(new_exe, 'wb') as f:
-                    while chunk := res.read(8192): f.write(chunk); downloaded += len(chunk)
+                with open(tmp_path, 'wb') as f:
+                    while chunk := res.read(8192):
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        downloaded += len(chunk)
             if total > 0 and downloaded != total: raise Exception("通信切断")
-            self.log("ダウンロード完了。再起動します...")
-            os.startfile(new_exe)
-            self.after(500, lambda: self._save_config() or self.stop_event.set() or self.app_exit_event.set() or self.after(500, lambda: self.destroy() or sys.exit(0)))
+            if hasher.hexdigest().lower() != expected_sha256.strip().lower():
+                raise Exception("ダウンロードしたファイルの検証に失敗しました（ハッシュ不一致）")
+            launch_path = self._swap_in_new_exe(tmp_path, version)
+            self.log("ダウンロード・検証完了。再起動します...")
+            self._run_on_ui(lambda: self._restart_into(launch_path))
         except Exception as e:
-            self.after(0, lambda: self.log(f"【エラー】アップデート失敗: {e}") or self.btn_start.configure(state="normal"))
+            # 不完全・不正なファイルは削除する
+            try:
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+            except Exception: pass
+            self.log(f"【エラー】アップデート失敗: {e}")
+            self._run_on_ui(lambda: self.btn_start.configure(state="normal"))
 
-    def _on_closing(self):
+    def _restart_into(self, launch_path):
+        self.is_running = False
         self._save_config()
         self.stop_event.set()
+        self.recovery_cancel.set()
         self.app_exit_event.set()
+        self._release_all_inputs()
+        # 新しいプロセスが多重起動判定に引っかからないよう、先に解放する
+        release_single_instance()
+        try:
+            os.startfile(launch_path)
+        except Exception as e:
+            self.log(f"【エラー】新しいバージョンを起動できませんでした: {e}")
+            return
+        self.after(300, lambda: self.destroy() or sys.exit(0))
+
+    def _on_closing(self):
+        self.is_running = False
+        self._save_config()
+        self.stop_event.set()
+        self.recovery_cancel.set()
+        self.app_exit_event.set()
+        self._release_all_inputs()
         self.after(500, lambda: self.destroy() or sys.exit(0))
 
 if __name__ == "__main__":
+    if not acquire_single_instance():
+        show_already_running_message()
+        sys.exit(0)
     app = VRCMacroApp()
     app.mainloop()
