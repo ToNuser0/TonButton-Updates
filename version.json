@@ -1,5 +1,6 @@
 {
-    "version": "1.0.8",
-    "url": "https://github.com/ToNuser0/TonButton-Updates/releases/download/v1.0.8/TonButton_Autoclick.exe",
-    "release_notes": "・ログが出力されない不具合を修正しました。"
+    "version": "1.0.9",
+    "url": "https://github.com/ToNuser0/TonButton-Updates/releases/download/v1.0.9/TonButton_Autoclick.exe",
+    "sha256": "07165deb1c06334c7bb0c3780f5625c00a8a06c461ef8d13c3a361c903a2ba58",
+    "release_notes": "・各種設定値を変更した際、表記のみが変更されない可能性のある不具合を修正しました。\n・リカバリーが適切に起動しない不具合を修正しました。\n・多重起動を防止するように修正しました。\n・エラーメッセージや画面描画の不具合を修正しました。\n・速度検知方法を修正しました。\n・各種文章を編集しました。"
 }
