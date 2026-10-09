@@ -8,7 +8,7 @@ pydirectinput.PAUSE = 0
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-CURRENT_VERSION = "1.0.9"
+CURRENT_VERSION = "1.1.0"
 UPDATE_INFO_URL = "https://raw.githubusercontent.com/ToNuser0/TonButton-Updates/main/version.json"
 
 EXE_BASE_NAME = "TonButton_Autoclick.exe"
